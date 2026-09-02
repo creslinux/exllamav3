@@ -328,6 +328,17 @@ struct BC_GatedDeltaNetSplit
         const at::Tensor& slots,
         bool history
     );
+
+    // Eager-path variant for external graph capture (raw kernels, no internal graph replay)
+    void run_bszN_eager
+    (
+        const at::Tensor& x,
+        at::Tensor& y,
+        at::Tensor& conv_state,
+        at::Tensor& recurrent_state,
+        const at::Tensor& slots,
+        bool history
+    );
 };
 
 

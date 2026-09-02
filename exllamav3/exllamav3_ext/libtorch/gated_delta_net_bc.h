@@ -164,7 +164,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("z_xh"),
     py::arg("o_xh")
 )
-.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN);
+.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN)
+.def("run_bszN_eager", &BC_GatedDeltaNetSplit::run_bszN_eager);
 
 py::class_<BC_Mamba2, std::shared_ptr<BC_Mamba2>>(m, "BC_Mamba2").def
 (
