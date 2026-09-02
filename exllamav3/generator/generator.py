@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -148,9 +149,20 @@ class Generator:
         # Draft model
         self.draft_model = draft_model
         self.draft_cache = draft_cache
+        # Two-stage speculation: consult the free host-side n-gram suffix matcher before the
+        # MTP draft loop each pass. A solid match drafts without any GPU forward; otherwise
+        # the pass falls back to MTP. Verification is exact either way, so the output
+        # distribution is unchanged. Enabled with EXL3_TWO_STAGE_SPEC=1 (MTP draft models
+        # only); EXL3_TWO_STAGE_MIN sets the match-length floor (default 3).
+        _two_stage = (
+            draft_model is not None
+            and draft_model.caps.get("mtp_draft", False)
+            and os.environ.get("EXL3_TWO_STAGE_SPEC", "0").lower() not in ("", "0", "false", "no")
+        )
         if draft_model:
-            assert not ngram_match_min, \
-                "Cannot use both draft model and n-gram draft."
+            if not _two_stage:
+                assert not ngram_match_min, \
+                    "Cannot use both draft model and n-gram draft."
             assert draft_cache is not None, \
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
@@ -167,6 +179,13 @@ class Generator:
             self.num_draft_tokens = 0
 
         self.ngram_match_min = ngram_match_min
+        # Under two-stage speculation the n-gram matcher is a component of the MTP draft
+        # path rather than a standalone drafter: set the floor here so jobs build their
+        # suffix automata (Job initial conditions key on ngram_match_min) and the draft
+        # dispatch can consult them.
+        self.two_stage = _two_stage
+        if self.two_stage:
+            self.ngram_match_min = max(2, int(os.environ.get("EXL3_TWO_STAGE_MIN", "3")))
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
@@ -424,7 +443,15 @@ class Generator:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
             elif self.mtp_draft:
-                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                # Two-stage: try the free n-gram drafter first; fall back to the MTP draft
+                # loop when no job has a solid suffix match. The MTP state stays aligned
+                # either way -- the post-verify draft-cache update from target hidden
+                # states runs whenever the draft model is present, not per drafter.
+                draft_tokens = None
+                if self.two_stage:
+                    draft_tokens = self.iterate_ngram_gen(results, min_len_floor = self.ngram_match_min)
+                if draft_tokens is None:
+                    draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
@@ -767,7 +794,7 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
-    def iterate_ngram_gen(self, results: list):
+    def iterate_ngram_gen(self, results: list, min_len_floor: int | None = None):
 
         # Get shape of active batch
         batch_size = 0
@@ -789,7 +816,7 @@ class Generator:
             min_len = min(min_len, d.shape[-1])
             draft_ids.append(d)
 
-        if min_len == 0:
+        if min_len == 0 or (min_len_floor is not None and min_len < min_len_floor):
             return None
 
         # Trim to minimum length in batch
