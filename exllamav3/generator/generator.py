@@ -200,6 +200,10 @@ class Generator:
                 dtype = torch.long,
                 pin_memory = False
             )
+            # Per-step draft confidence scores staged here with non_blocking copies during
+            # drafting and read once per round after a single synchronize, replacing a
+            # per-step .cpu() that drained the pipeline at every drafted token
+            self.draft_conf_pinned = None
 
         # CPU page cache tier
         self.cpu_page_cache = None
@@ -485,6 +489,41 @@ class Generator:
         self.visualizer.update(chains, usage)
 
 
+    def _draft_conf_stage(self, batch_size: int, window: int):
+        """
+        (Re)allocate the pinned confidence staging buffer for this round.
+        """
+        if (self.draft_conf_pinned is None or
+                self.draft_conf_pinned.shape[0] < batch_size or
+                self.draft_conf_pinned.shape[1] < window):
+            self.draft_conf_pinned = torch.empty(
+                (max(batch_size, 16), max(window, self.num_draft_tokens or window)),
+                dtype = torch.float32,
+                pin_memory = True,
+            )
+        return self.draft_conf_pinned
+
+    def confidence_window_cut(self, conf_host: torch.Tensor, cal, window: int) -> int:
+        """
+        Host-side confidence truncation over a whole drafted window. Reproduces the
+        historical sequential drafting break exactly: drafting stopped after step idx once
+        every row's running product of estimated conditional acceptance probabilities
+        ("reach") fell below the calibrator confidence, keeping the first low-confidence
+        token as the label probe.
+
+        :param conf_host: [batch, >= window] host tensor of per-step confidence scores
+        :param cal: draft-confidence calibrator
+        :param window: full drafted window width
+        :return: truncated window (== window when no cut applies)
+        """
+        reach = None
+        for idx in range(window):
+            est = [cal.estimate(v) for v in conf_host[:, idx].tolist()]
+            reach = est if reach is None else [r * e for r, e in zip(reach, est)]
+            if idx + 1 < window and max(reach) < cal.confidence:
+                return idx + 1
+        return window
+
     def iterate_draftmodel_gen(self, results: list):
 
         self._draft_conf_round = None
@@ -533,8 +572,8 @@ class Generator:
         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
         window = self.num_draft_tokens
         cal = self.draft_calibrator
-        conf_cols = []
-        reach = None
+        window = self.num_draft_tokens
+        cal = self.draft_calibrator
         for idx in range(window):
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
@@ -547,19 +586,15 @@ class Generator:
             )
             if cal is not None:
                 conf, new_ids = torch.max(batch_logits, dim = -1)
+                conf_pinned = self._draft_conf_stage(batch_size, window)
+                conf_pinned[:batch_size, idx:idx+1].copy_(
+                    conf.reshape(batch_size, 1).float(), non_blocking = True
+                )
             else:
                 new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
-            if cal is not None:
-                c = conf.float().cpu()
-                conf_cols.append(c)
-                est = [cal.estimate(v) for v in c.view(-1).tolist()]
-                reach = est if reach is None else [r * e for r, e in zip(reach, est)]
-                if idx + 1 < window and max(reach) < cal.confidence:
-                    window = idx + 1
-                    break
 
         self.draft_model.prefill(
             input_ids = batch_ids,
@@ -571,10 +606,16 @@ class Generator:
             }
         )
 
-        if conf_cols:
+        # One drain for the whole round, then the confidence truncation that the per-step
+        # loop used to apply inline (same reach rule, computed on the staged matrix)
+        if cal is not None:
+            torch.cuda.synchronize()
+            window = self.confidence_window_cut(
+                self.draft_conf_pinned[:batch_size, :window], cal, window
+            )
             self._draft_conf_round = {
                 "ids": self.draft_ids_pinned[:batch_size, :window],
-                "conf": torch.cat(conf_cols, dim = 1),
+                "conf": self.draft_conf_pinned[:batch_size, :window].clone(),
                 "window": window,
             }
 
@@ -628,13 +669,12 @@ class Generator:
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
-        # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
-        # every row's running product of estimated conditional acceptance probabilities falls
-        # below the confidence target, keeping the first low-confidence token as the label probe
+        # Greedy sample batched draft tokens. Confidence scores are staged per step into a
+        # pinned buffer with non_blocking copies; the calibrated window truncation that the
+        # per-step loop used to apply inline (breaking drafting early) is computed once on
+        # the staged matrix after a single synchronize, with the same reach rule.
         window = self.num_draft_tokens
         cal = self.draft_calibrator
-        conf_cols = []
-        reach = None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -655,18 +695,19 @@ class Generator:
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:
-                c = draft_conf.float().cpu()
-                conf_cols.append(c)
-                est = [cal.estimate(v) for v in c.view(-1).tolist()]
-                reach = est if reach is None else [r * e for r, e in zip(reach, est)]
-                if idx + 1 < window and max(reach) < cal.confidence:
-                    window = idx + 1
-                    break
+                conf_pinned = self._draft_conf_stage(batch_size, window)
+                conf_pinned[:batch_size, idx:idx+1].copy_(
+                    draft_conf.reshape(batch_size, 1).float(), non_blocking = True
+                )
 
-        if conf_cols and len(conf_cols) == window:
+        if cal is not None:
+            torch.cuda.synchronize()
+            window = self.confidence_window_cut(
+                self.draft_conf_pinned[:batch_size, :window], cal, window
+            )
             self._draft_conf_round = {
                 "ids": self.draft_ids_pinned[:batch_size, :window],
-                "conf": torch.cat(conf_cols, dim = 1),
+                "conf": self.draft_conf_pinned[:batch_size, :window].clone(),
                 "window": window,
             }
 
