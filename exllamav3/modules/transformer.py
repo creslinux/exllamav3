@@ -5,6 +5,7 @@ from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
 from .hyperconnections import HyperConnection
+from . import block_graph
 from ..util import profile_opt
 
 class TransformerBlock(Module):
@@ -140,6 +141,12 @@ class TransformerBlock(Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        # Per-block graph replay for decode-shaped GDN forwards (EXL3_BLOCK_GRAPH=1);
+        # capture-internal calls fall through to the eager body below
+        if block_graph.ENABLED and not block_graph._in_capture:
+            if block_graph.eligible(self, params, x):
+                return block_graph.run(self, x, params)
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
