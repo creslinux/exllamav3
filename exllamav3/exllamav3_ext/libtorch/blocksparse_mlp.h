@@ -171,7 +171,23 @@ struct BC_BlockSparseMLP
         Graph* graph
     );
 
+    void run_bszN_impl
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights,
+        bool allow_graph
+    );
+
     void run_bszN
+    (
+        const at::Tensor& y,
+        at::Tensor& selected_experts,
+        at::Tensor& routing_weights
+    );
+
+    // Eager-path variant for external graph capture (raw kernels, no internal graph replay)
+    void run_bszN_eager
     (
         const at::Tensor& y,
         at::Tensor& selected_experts,

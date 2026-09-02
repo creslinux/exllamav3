@@ -224,11 +224,12 @@ void BC_BlockSparseMLP::run_bszN_gr
     }
 }
 
-void BC_BlockSparseMLP::run_bszN
+void BC_BlockSparseMLP::run_bszN_impl
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
-    at::Tensor& routing_weights
+    at::Tensor& routing_weights,
+    bool allow_graph
 )
 {
     int num_tokens = (int) y.size(0);
@@ -279,12 +280,7 @@ void BC_BlockSparseMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
-    if (g.disabled || (!g.ready && !g.ready_to_record))
-    {
-        run_bszN_gr(A_in, x_dense, selected_experts, routing_weights, num_tokens, nullptr);
-        g.ready_to_record = true;
-    }
-    else
+    if (allow_graph && !(g.disabled || (!g.ready && !g.ready_to_record)))
     {
         if (!g.ready)
         {
@@ -366,6 +362,37 @@ void BC_BlockSparseMLP::run_bszN
 
         g.launch(args, stream);
     }
+    else
+    {
+        // Eager: internal graphs unusable (disabled, not yet warmed, or allow_graph == false
+        // for external block-level capture)
+        run_bszN_gr(A_in, x_dense, selected_experts, routing_weights, num_tokens, nullptr);
+        g.ready_to_record = true;
+    }
+}
+
+void BC_BlockSparseMLP::run_bszN
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights
+)
+{
+    run_bszN_impl(y, selected_experts, routing_weights, true);
+}
+
+void BC_BlockSparseMLP::run_bszN_eager
+(
+    const at::Tensor& y,
+    at::Tensor& selected_experts,
+    at::Tensor& routing_weights
+)
+{
+    // Eager-path entry point for external graph capture: runs the per-call input gather
+    // (capturable GPU ops) then the layer's raw kernels via run_bszN_gr with a null Graph,
+    // never replaying the internal graph (illegal inside an outer capture). The gather
+    // writes static per-slot buffers, so replay-time addresses are stable.
+    run_bszN_impl(y, selected_experts, routing_weights, false);
 }
 
 BC_BlockSparseMLP::BC_BlockSparseMLP

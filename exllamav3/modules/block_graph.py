@@ -77,7 +77,14 @@ def eligible(block, params: dict, x: torch.Tensor) -> bool:
         return False
     if params.get("prefill") or params.get("export_state_layers"):
         return False
-    if x.size(0) > 8 or x.size(1) > 16:
+    bsz, qlen = x.size(0), x.size(1)
+    # True decode shapes only: single-token decode/draft (q_len 1) and MTP
+    # verify windows (q_len = num_draft + 1). Larger q_len covers unflagged
+    # prefill tail-chunks etc., whose MoE path (bincount/tolist) contains
+    # capture-illegal host syncs.
+    if qlen > 7:
+        return False
+    if bsz * qlen > 8:
         return False
     return True
 
@@ -116,7 +123,9 @@ def run(block, x: torch.Tensor, params: dict):
         # state cache tensors themselves are address-stable and pass through.
         device = x.device
         slots_live = _live_slots(params, device)
-        slots_s = slots_live.clone()
+        # params["recurrent_slots"] may be a CPU tensor uploaded lazily via the
+        # params dev-cache; the static copy must live on this block's device
+        slots_s = slots_live.detach().to(device, copy = True)
         params_c = dict(params)
         # get_for_device caches by tensor identity in params["dev_cache"];
         # a fresh dict without the cache ensures our static buffer is what
@@ -129,13 +138,15 @@ def run(block, x: torch.Tensor, params: dict):
         _shim_block(block)
         side = torch.cuda.Stream(device = device)
         side.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(side):
-            _ = block.forward(x_s, params_c)      # settle lazy state
-        torch.cuda.current_stream(device).wait_stream(side)
-
+        # Re-entrancy guard: the settle and capture calls below must run the
+        # eager body (TransformerBlock.forward's gate checks _in_capture), or
+        # each capture attempt would re-enter run() and recurse
         prev = _in_capture
         _in_capture = True
         try:
+            with torch.cuda.stream(side):
+                _ = block.forward(x_s, params_c)      # settle lazy state
+            torch.cuda.current_stream(device).wait_stream(side)
             with torch.cuda.graph(graph, stream = side):
                 y_s = block.forward(x_s, params_c)
         finally:

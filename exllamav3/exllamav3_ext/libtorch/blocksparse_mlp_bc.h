@@ -108,5 +108,6 @@ py::class_<BC_BlockSparseMLP, std::shared_ptr<BC_BlockSparseMLP>>(m, "BC_BlockSp
     py::arg("act_relu2") = false
 )
 .def("run_bszN", &BC_BlockSparseMLP::run_bszN)
+.def("run_bszN_eager", &BC_BlockSparseMLP::run_bszN_eager)
 .def("run_single_expert", &BC_BlockSparseMLP::run_single_expert)
 .def("run_single_expert_dq", &BC_BlockSparseMLP::run_single_expert_dq);

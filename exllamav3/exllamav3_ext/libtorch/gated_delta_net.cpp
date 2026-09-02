@@ -284,7 +284,6 @@ void BC_GatedDeltaNetSplit::run_bszN
         graph_hist_stride = (int) recurrent_state.size(1);
         return;
     }
-
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
     // so a cache with different dimensions falls back to the eager path
     if ((int) conv_state.size(2) != graph_state_size ||
@@ -328,6 +327,34 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     s.graph->launch(args, stream);
+}
+
+void BC_GatedDeltaNetSplit::run_bszN_eager
+(
+    const at::Tensor& x,
+    at::Tensor& y,
+    at::Tensor& conv_state,
+    at::Tensor& recurrent_state,
+    const at::Tensor& slots,
+    bool history
+)
+{
+    // Eager-path entry point for external (e.g. block-level) graph capture: launches the
+    // layer's raw kernels on the current stream via run_bszN_gr with a null Graph, never
+    // touching this module's own internal CUDA graphs (whose replay is illegal inside an
+    // outer capture). Slot statics are used as usual; the caller is responsible for the
+    // lifetime and address stability of x/y/state tensors across the capture.
+    py::gil_scoped_release release;
+    c10::cuda::CUDAGuard device_guard(x.device());
+
+    int bsz = (int) x.size(0);
+    int seqlen = (int) x.size(1);
+    TORCH_CHECK(bsz >= 1 && bsz <= MAX_BSZ && seqlen >= 1 && seqlen <= MAX_QLEN,
+                "BC_GatedDeltaNetSplit::run_bszN_eager: shape out of range");
+    Slot& s = slot(bsz, seqlen, history);
+    TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN_eager: slot not configured");
+
+    run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
 }
 
 bool BC_Mamba2::needs_configure(int bsz, int seqlen, bool history)
