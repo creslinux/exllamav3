@@ -245,6 +245,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             int row = rows[s];
             const half* gu_e = reinterpret_cast<const half*>(gu_ptrs[src]);
@@ -267,6 +268,7 @@ void p2b_moe_batched_kernel(
             int rem = item >> 1;
             int s = rem / num_groups_gate;
             int group = rem % num_groups_gate;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
 
             const uint32_t* B32 = reinterpret_cast<const uint32_t*>(is_up ? ut_ptrs[src] : gt_ptrs[src]);
@@ -289,6 +291,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             const half* gv_e = reinterpret_cast<const half*>(gv_ptrs[src]);
             const half* uv_e = reinterpret_cast<const half*>(uv_ptrs[src]);
@@ -305,6 +308,7 @@ void p2b_moe_batched_kernel(
     {
         int total_elements = slots * inter;
         for (int j = tid; j < total_elements; j += total_threads) {
+            if (__half2float(rw[j / inter]) == 0.0f) continue;
             float g = __half2float(gate[j]);
             float u = __half2float(up[j]);
             float s = g / (1.0f + expf(-g));
@@ -320,6 +324,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             const half* du_e = reinterpret_cast<const half*>(du_ptrs[src]);
             half* hd_e = had_down + (size_t) s * inter;
@@ -336,6 +341,7 @@ void p2b_moe_batched_kernel(
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
             int s = item / num_groups_down;
             int group = item % num_groups_down;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
 
             const uint32_t* B32 = reinterpret_cast<const uint32_t*>(dt_ptrs[src]);
@@ -358,6 +364,7 @@ void p2b_moe_batched_kernel(
         for (; this_warp < total_warps; this_warp += grid_warps) {
             int s = this_warp / warps_per_exp;
             int w = this_warp % warps_per_exp;
+            if (__half2float(rw[s]) == 0.0f) continue;
             int src = ids[s];
             const half* dv_e = reinterpret_cast<const half*>(dv_ptrs[src]);
             half* dp_e = down + (size_t) s * hidden;
@@ -372,7 +379,8 @@ void p2b_moe_batched_kernel(
             int s = j / hidden;
             int col = j % hidden;
             float w = __half2float(rw[s]);
-            atomicAdd(accum + (size_t) rows[s] * hidden + col, w * __half2float(down[j]));
+            if (w != 0.0f)
+                atomicAdd(accum + (size_t) rows[s] * hidden + col, w * __half2float(down[j]));
         }
         grid.sync();
     }
