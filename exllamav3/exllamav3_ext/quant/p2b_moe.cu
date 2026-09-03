@@ -39,6 +39,9 @@ __device__ __forceinline__ void run_gemv_tile(
     int lane,
     float (*sh_red)[1][32])
 {
+    // Verbatim extraction of exllamav3's exl3_gemv_kernel group-loop body (MMODE = 0,
+    // SMEM_STAGE = false), the production-validated m=1 decode GEMV. The reference port's
+    // tile was textually close but numerically wrong against this tree's kernel.
     constexpr int WK = CFG == 0 ? 16 : 8;
     constexpr int WNT = CFG == 0 ? 2 : 4;
     constexpr int PF = CFG == 0 ? 4 : 2;
@@ -152,16 +155,21 @@ __device__ __forceinline__ void run_gemv_tile(
         }
     }
 
-    // Warp reduction
-    if (lane < 4) {
-        #pragma unroll
-        for (int t = 0; t < WNT; ++t) {
+    // Cross-warp reduction over the k splits: lane l holds row l/4, cols
+    // tile*16 + frag*8 + 2*(l%4) (+1) -- exactly the production kernel's mapping
+    {
+        const int c0 = 2 * (lane & 3);
+        if (lane < 4)
+        {
             #pragma unroll
-            for (int f = 0; f < 2; ++f) {
-                const int col = t * 16 + f * 8 + (lane & 3) * 2;
-                sh_red[warp][0][col + 0] = acc0[t][f].x;
-                sh_red[warp][0][col + 1] = acc0[t][f].y;
-            }
+            for (int t = 0; t < WNT; ++t)
+                #pragma unroll
+                for (int f = 0; f < 2; ++f)
+                {
+                    const int col = t * 16 + f * 8 + c0;
+                    sh_red[warp][0][col + 0] = acc0[t][f].x;
+                    sh_red[warp][0][col + 1] = acc0[t][f].y;
+                }
         }
     }
     __syncthreads();
@@ -204,7 +212,8 @@ void p2b_moe_batched_kernel(
     int slots,
     int m,
     int hidden,
-    int inter)
+    int inter,
+    int stop_after)
 {
     auto grid = cg::this_grid();
     const int warp = threadIdx.x / 32;
@@ -250,6 +259,7 @@ void p2b_moe_batched_kernel(
     }
 
     // Phase 2: Batched Gate & Up GEMV across all slots
+    if (stop_after >= 2)
     {
         int total_work = 2 * slots * num_groups_gate;
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
@@ -269,6 +279,7 @@ void p2b_moe_batched_kernel(
     }
 
     // Epilogue Hadamard on Gate and Up
+    if (stop_after >= 2)
     {
         int warps_per_exp = inter / 128;
         int total_warps = slots * warps_per_exp;
@@ -319,6 +330,7 @@ void p2b_moe_batched_kernel(
     }
 
     // Phase 4: Batched Down GEMV across all slots
+    if (stop_after >= 4)
     {
         int total_work = slots * num_groups_down;
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
@@ -336,6 +348,7 @@ void p2b_moe_batched_kernel(
     }
 
     // Down output Hadamard and atomic accumulation into accum
+    if (stop_after >= 4)
     {
         int warps_per_exp = hidden / 128;
         int total_warps = slots * warps_per_exp;
@@ -365,6 +378,7 @@ void p2b_moe_batched_kernel(
     }
 
     // Write back to out
+    if (stop_after >= 4)
     for (int j = tid; j < m * hidden; j += total_threads) {
         out[j] = __float2half(accum[j]);
     }
@@ -379,7 +393,7 @@ static void launch_moe_batched(
     const at::Tensor& rw, at::Tensor& out, at::Tensor& gate, at::Tensor& up,
     at::Tensor& down, at::Tensor& had_gate, at::Tensor& had_up,
     at::Tensor& had_down, at::Tensor& accum,
-    int slots, int m, int hidden, int inter)
+    int slots, int m, int hidden, int inter, int stop_after = 4)
 {
     int dev = 0, sms = 0, resident = 0;
     cudaGetDevice(&dev);
@@ -420,7 +434,7 @@ static void launch_moe_batched(
         (void*)&idp, (void*)&rowp, (void*)&rwp,
         (void*)&gp, (void*)&up_p, (void*)&dp, (void*)&op,
         (void*)&hg_p, (void*)&hu_p, (void*)&hd_p, (void*)&accp,
-        (void*)&e, (void*)&m, (void*)&hidden, (void*)&inter
+        (void*)&e, (void*)&m, (void*)&hidden, (void*)&inter, (void*)&stop_after
     };
 
     cuda_check(cudaLaunchCooperativeKernel(kernel, dim3(grid), dim3(512), args, 0, stream));
@@ -432,13 +446,15 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
     const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
     const at::Tensor& ids, const at::Tensor& rows, const at::Tensor& rw,
-    int64_t kg, int64_t ku, int64_t kd, bool mcg,
+    int64_t kg, int64_t ku, int64_t kd, bool mcg, bool mul1,
     int64_t hidden, int64_t inter)
 {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "p2b fused MoE requires CUDA fp16 input");
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "p2b fused MoE output must be CUDA fp16");
     TORCH_CHECK(kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
-    const int cb = mcg ? 1 : 0;  // codebook select: 1 = MCG, 0 = mul1
+    TORCH_CHECK(!(mcg && mul1), "specified both mcg and mul1");
+    // Codebook select, mirroring exl3_gemv.cu: 0 = default (neither flag), 1 = MCG, 2 = mul1
+    const int cb = mcg ? 1 : (mul1 ? 2 : 0);
     TORCH_CHECK(hidden % 128 == 0 && inter % 128 == 0, "p2b fused MoE requires hidden/inter divisible by 128");
     const int slots = static_cast<int>(ids.numel());
     const int m = static_cast<int>(x.numel() / x.size(-1));
@@ -452,10 +468,53 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     auto accum = at::zeros({m, hidden}, x.options().dtype(at::kFloat));
 
     #define P2B_DISPATCH(BITS, CB) launch_moe_batched<BITS, CB>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter)
-    if (kg == 4) { if (cb) P2B_DISPATCH(4, 1); else P2B_DISPATCH(4, 0); }
-    else if (kg == 3) { if (cb) P2B_DISPATCH(3, 1); else P2B_DISPATCH(3, 0); }
-    else if (kg == 2) { if (cb) P2B_DISPATCH(2, 1); else P2B_DISPATCH(2, 0); }
+    #define P2B_SWITCH_CB(BITS) \
+        switch (cb) { case 0: P2B_DISPATCH(BITS, 0); break; \
+                      case 1: P2B_DISPATCH(BITS, 1); break; \
+                      case 2: P2B_DISPATCH(BITS, 2); break; }
+    if (kg == 4) P2B_SWITCH_CB(4)
+    else if (kg == 3) P2B_SWITCH_CB(3)
+    else if (kg == 2) P2B_SWITCH_CB(2)
+    #undef P2B_SWITCH_CB
     #undef P2B_DISPATCH
 
     return out;
+}
+
+std::vector<at::Tensor> p2b_stage_debug_cuda(const at::Tensor& x,
+    const at::Tensor& gt, const at::Tensor& gu, const at::Tensor& gv,
+    const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
+    const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
+    const at::Tensor& ids, const at::Tensor& rows, const at::Tensor& rw,
+    int64_t kg, int64_t ku, int64_t kd, bool mcg, bool mul1,
+    int64_t hidden, int64_t inter, int64_t stop_after)
+{
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "p2b debug requires CUDA fp16 input");
+    TORCH_CHECK(kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
+    TORCH_CHECK(hidden % 128 == 0 && inter % 128 == 0, "p2b requires hidden/inter divisible by 128");
+    const int slots = static_cast<int>(ids.numel());
+    const int m = static_cast<int>(x.numel() / x.size(-1));
+
+    auto gate = at::empty({slots, inter}, x.options());
+    auto up = at::empty({slots, inter}, x.options());
+    auto down = at::empty({slots, hidden}, x.options());
+    auto had_gate = at::empty({slots, hidden}, x.options());
+    auto had_up = at::empty({slots, hidden}, x.options());
+    auto had_down = at::empty({slots, inter}, x.options());
+    auto accum = at::zeros({m, hidden}, x.options().dtype(at::kFloat));
+    auto out = at::empty({m, hidden}, x.options());
+
+    TORCH_CHECK(!(mcg && mul1), "specified both mcg and mul1");
+    const int cb = mcg ? 1 : (mul1 ? 2 : 0);
+    #define P2B_DBG(BITS, CB) launch_moe_batched<BITS, CB>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter, (int)stop_after)
+    #define P2B_DBG_CB(BITS) \
+        switch (cb) { case 0: P2B_DBG(BITS, 0); break; \
+                      case 1: P2B_DBG(BITS, 1); break; \
+                      case 2: P2B_DBG(BITS, 2); break; }
+    if (kg == 4) P2B_DBG_CB(4)
+    else if (kg == 3) P2B_DBG_CB(3)
+    else P2B_DBG_CB(2)
+    #undef P2B_DBG_CB
+    #undef P2B_DBG
+    return {had_gate, had_up, gate, up, had_down, down, out};
 }
