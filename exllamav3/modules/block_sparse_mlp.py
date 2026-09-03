@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -7,6 +8,13 @@ from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+
+# Cooperative fused-MoE path (p2b port): decode-shaped passes route through ext.p2b_fused_moe
+# with slot tables instead of the dense bc graph. Under TP the caller zero-weights out-of-range
+# slots and the kernel skips them, so a rank pays only its ~active slots instead of traversing
+# all bsz*topk (bc dense: ~129 us fixed + 6.4 us/slot; p2b: ~21 us + 5.2 us/slot, skipped slots
+# a predicate).
+_p2b_moe_env = os.environ.get("EXL3_P2B_MOE", "0").lower() in ("1", "true", "yes")
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
@@ -635,6 +643,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.bc = None
         self.bc_sh_exp = False
+        self.p2b_ok = None
+        self.p2b_ids = None
+        self.p2b_rw = None
+        self.p2b_rows = None
+        self.p2b_out = None
         self.fused_mode_buffers = None
         self._cpu_init_state()
 
@@ -996,6 +1009,62 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         super().unload()
 
 
+    def _p2b_ok(self):
+        if self.p2b_ok is None:
+            mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
+            ok = (
+                self.is_quantized and
+                self.gated and
+                self.activation_fn == "silu" and
+                self.act_limit in (None, 0.0) and   # 0.0 is the constructor default = no limit
+                mg is not None and mu is not None and md is not None and
+                mg.K == mu.K == md.K and mg.K in (2, 3, 4) and
+                self.hidden_size % 128 == 0 and
+                self.intermediate_size_padded % 128 == 0 and
+                not self.cpu_offload and
+                not self.config.infer_params.no_reconstruct
+            )
+            self.p2b_ok = bool(ok)
+        return self.p2b_ok
+
+    def _p2b_forward_bszn(self, y, bsz, selected_experts, routing_weights):
+        mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
+        E = self.num_local_experts
+        topk = self.num_experts_per_tok
+        n = bsz * topk
+
+        if self.p2b_ids is None:
+            cap = 16 * topk
+            self.p2b_ids = torch.empty(cap, dtype = torch.int32, device = self.device)
+            self.p2b_rw = torch.empty(cap, dtype = torch.half, device = self.device)
+            self.p2b_rows = {}
+            self.p2b_out = torch.empty((16, self.hidden_size), dtype = torch.half, device = self.device)
+        if bsz not in self.p2b_rows:
+            self.p2b_rows[bsz] = torch.arange(bsz, device = self.device) \
+                .repeat_interleave(topk).to(torch.int32)
+
+        local = selected_experts.reshape(-1)
+        rw = routing_weights.reshape(-1)
+        if self.routing_first is not None and E != self.num_experts:
+            local = local - self.routing_first
+            valid = (local >= 0) & (local < E)
+            local = local.clamp(0, E - 1)
+            rw = rw * valid.to(torch.half)
+
+        self.p2b_ids[:n].copy_(local.to(torch.int32))
+        self.p2b_rw[:n].copy_(rw)
+        out = self.p2b_out[:bsz]
+        ext.p2b_fused_moe(
+            y, out,
+            mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh,
+            mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh,
+            md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh,
+            self.p2b_ids[:n], self.p2b_rows[bsz], self.p2b_rw[:n],
+            mg.K, mg.K, mg.K, bool(mg.mcg), bool(mg.mul1),
+            self.hidden_size, self.intermediate_size_padded,
+        )
+        return out.float().view((bsz, self.hidden_size))
+
     @override
     def forward(
         self,
@@ -1247,6 +1316,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # multi-row BC_GatedMLP graph, fused into the same capture. Expert-range shards (CPU
         # split, TP) produce a partial sum here: out-of-range picks are masked inactive inside
         # the mgemm kernel and contribute exact zeros
+        elif bszn_eligible and _p2b_moe_env and self._p2b_ok():
+            # p2b slot-table path: shared experts fall through to the common eager tail below
+            # (bc_sh_exp stays False), applied against x like the non-graph paths; the final
+            # block-level reduction handles the per-rank partial sums under TP
+            final_hidden_states = self._p2b_forward_bszn(y, bsz, selected_experts, routing_weights).view(x.shape)
+
         elif bszn_eligible:
             self.bc.run_bszN(y, selected_experts, routing_weights)
             if self.experts_cfg.out_trim is not None:
