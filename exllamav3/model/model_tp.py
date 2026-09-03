@@ -347,9 +347,11 @@ class Model_TPMixin:
         return r
 
 
-    def tp_dispatch_lm_head_argmax(self, args):
+    def tp_dispatch_lm_head_argmax(self, args, return_values = False):
         """
-        Compute argmax over a tensor-parallel sharded LM head.
+        Compute argmax over a tensor-parallel sharded LM head. With return_values, also returns
+        the winning logit value (the draft-confidence path needs the max value, not just the
+        index).
 
         Each device that owns a non-empty LM-head slice computes local maximum values and vocabulary indices for
         its shard. The partial maxima are gathered to the output device, where the final winner is selected and the
@@ -407,6 +409,9 @@ class Model_TPMixin:
         inds = torch.stack(inds, dim = -1)
         winner = vals.argmax(dim = -1)
         argmax = inds.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        if return_values:
+            max_vals = vals.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+            return argmax, max_vals
         return argmax
 
 

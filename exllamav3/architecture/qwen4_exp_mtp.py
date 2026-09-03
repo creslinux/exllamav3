@@ -172,12 +172,23 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = state.to(mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
-        ll = self.attached_model().logit_layer_idx
-        lm = self.attached_model().modules[ll]
+        target = self.attached_model()
+        if target.loaded_tp:
+            # The shared lm_head is sharded across ranks: ship the collapsed state to the
+            # workers and take the sharded argmax (qwen3_5 MTP pattern). With draft
+            # confidence enabled, also return the winning logit value.
+            sent = target.tp_producer.send(state)
+            if params.get("export_draft_conf"):
+                argmax, max_vals = target.tp_dispatch_lm_head_argmax((sent, {}), return_values = True)
+                params["draft_conf"] = max_vals
+                return argmax
+            return target.tp_dispatch_lm_head_argmax((sent, {}))
+        ll = target.logit_layer_idx
+        lm = target.modules[ll]
         logits = lm.prepare_for_device(state, params)
         logits = lm.forward(logits, params)
         if params.get("export_draft_conf"):
-            logits = logits[..., :self.attached_model().config.vocab_size]
+            logits = logits[..., :target.config.vocab_size]
             conf, ids = torch.max(logits, dim = -1)
             params["draft_conf"] = conf
             return ids
