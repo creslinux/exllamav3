@@ -229,9 +229,11 @@ class TPBackendNative:
         small buffer for tiny gathers. LL is dedicated to low-latency broadcasts so consumers can acknowledge and
         exit without blocking other collectives. CUDA workers register these buffers as pinned host memory.
 
-        all_reduce() currently routes through pg_all_reduce_cpu(): GPU workers publish their contributions into the
-        R buffer, a designated CPU helper performs the reduction over host memory, and workers copy the reduced
-        result back. This avoids relying on NCCL for the native backend, at the cost of PCIe traffic and CPU work.
+        all_reduce() routes small float payloads through the device-side ring over the B buffer
+        (pg_all_reduce) and everything else through pg_all_reduce_cpu(): GPU workers publish their
+        contributions into the R buffer, a designated CPU helper performs the reduction over host
+        memory, and workers copy the reduced result back. The CPU path avoids relying on NCCL for
+        the native backend, at the cost of PCIe traffic and CPU work.
         """
 
         self.uuid = uuid
@@ -247,6 +249,10 @@ class TPBackendNative:
         self.master = master
         self.cpu = cpu
         self.cpu_is_pinned = False
+
+        # Debug/isolation override: EXL3_TP_DEVICE_REDUCE=0 forces every reduce onto the host path
+        # (upstream behaviour). Read once here -- all_reduce runs ~100x per forward pass.
+        self.no_device_reduce = os.environ.get("EXL3_TP_DEVICE_REDUCE", "1").lower() in ("", "0", "false", "no")
 
         size_g = GLOBALS_SIZE
         size_b = self.shbuf_size
@@ -448,22 +454,21 @@ class TPBackendNative:
         # Small payloads take the device-side ring reduce over the peer-shared B buffer: no host
         # round trip, no CPU work -- the host-staged path costs a PCIe traversal plus a CPU
         # reduction per collective, which dominated decode on PCIe rigs (the CPU reduce is also
-        # single-threaded AVX2 on many hosts). Above the threshold (or non-float dtypes) the host
-        # path remains the fallback.
+        # single-threaded AVX2 on many hosts). Above the threshold (or non-float dtypes, or
+        # non-contiguous tensors, which the ring kernel's flat addressing does not support) the
+        # host path remains the fallback.
         # Routing MUST NOT depend on `contribution`: zero-width TP shards (e.g. attention layers
         # whose 2 heads split 4-way as 0/1/1/0) call all_reduce(x, False) with a full-size zeros
         # tensor while their siblings call it with contribution=True. Routing on contribution
         # sends different ranks of the SAME collective into different kernels, and both sides
         # wait for full participation -- deadlock. The ring handles contribution=False naturally:
-        # the zero shards stage their zeros and the sum is unchanged.
-        # EXL3_TP_DEVICE_REDUCE=0 forces every reduce onto the host path (upstream behaviour),
-        # used to isolate device-ring defects.
-        _no_device_reduce = os.environ.get("EXL3_TP_DEVICE_REDUCE", "1").lower() in ("", "0", "false", "no")
+        # the zero shards stage their zeros and the sum is unchanged. Every input to the gate
+        # below (dtype, contiguity, size, alignment) is rank-uniform for a given collective.
         if (
-            not _no_device_reduce and
-            self.device >= 0 and
+            not self.no_device_reduce and
             self.device >= 0 and
             tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and
+            tensor.is_contiguous() and
             tensor.numel() * tensor.element_size() < MAX_DEVICE_REDUCE and
             tensor.numel() * tensor.element_size() % 16 == 0
         ):
