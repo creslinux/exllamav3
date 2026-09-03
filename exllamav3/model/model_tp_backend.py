@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 import time
@@ -202,6 +203,12 @@ class TPBackendNative:
         self.cpu = cpu
         self.cpu_is_pinned = False
 
+        # Timing probe: EXL3_TP_STUB_COLLECTIVES=1 turns the data collectives into no-ops so the
+        # forward can be timed without communication cost. Output is garbage; never use for
+        # inference. The barrier is kept (stream ordering, no data movement).
+        self.stub_collectives = \
+            os.environ.get("EXL3_TP_STUB_COLLECTIVES", "0").lower() in ("1", "true", "yes")
+
         size_g = GLOBALS_SIZE
         size_b = self.shbuf_size
         size_r = SHBUF_SIZE_R
@@ -372,6 +379,8 @@ class TPBackendNative:
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
+        if self.stub_collectives:
+            return
         if tensor.numel() * tensor.element_size() <= 2048:
             ext.pg_broadcast_ll(
                 self.ptr_g,
@@ -399,6 +408,8 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self.stub_collectives:
+            return
         # CPU-assisted path unconditionally, matching upstream: GPU workers stage into the R
         # buffer, the -1 CPU helper reduces over host memory, workers copy the result back.
         # The device-side ring (pg_all_reduce over the B buffer) was re-enabled briefly and
@@ -431,6 +442,8 @@ class TPBackendNative:
         out_device: int,
         ldims: list[int]
     ):
+        if self.stub_collectives:
+            return
         if out_device == self.device:
             assert out_tensor is not None, \
                 f"Gather: Output device must supply output tensor"
@@ -460,6 +473,8 @@ class TPBackendNative:
         out_device: int,
         ldims: list[int]
     ):
+        if self.stub_collectives:
+            return
         if out_device == self.device:
             assert out_tensor is not None, \
                 f"Gather small: Output device must supply output tensor"
