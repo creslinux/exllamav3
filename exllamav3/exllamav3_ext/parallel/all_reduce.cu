@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include "all_reduce.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -26,6 +27,7 @@ void pg_all_reduce_kernel
     uint8_t* __restrict__ shbuf_ptr,
     const size_t data_size,
     const size_t shbuf_size,
+    const int dtype_flag,
     uint32_t* abort_flag
 )
 {
@@ -133,14 +135,58 @@ void pg_all_reduce_kernel
                         // First num_ranks - 1 iterations: accumulate
                         if (iter < num_ranks - 1)
                         {
-                            float4* src = (float4*) shbuf_stage_ptr(this_rank, stage_recv);
-                            float4* dst = (float4*) data_stage_ptr(recv_seg, stage_recv);
-                            if (dst + t < (float4*) data_end)
+                            if (dtype_flag == 0)
                             {
-                                float4 a = dst[t];
-                                float4 b = src[t];
-                                a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
-                                dst[t] = a;
+                                // fp32: 16-byte chunks are 4 floats
+                                float4* src = (float4*) shbuf_stage_ptr(this_rank, stage_recv);
+                                float4* dst = (float4*) data_stage_ptr(recv_seg, stage_recv);
+                                if (dst + t < (float4*) data_end)
+                                {
+                                    float4 a = dst[t];
+                                    float4 b = src[t];
+                                    a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
+                                    dst[t] = a;
+                                }
+                            }
+                            else
+                            {
+                                // fp16 (1) / bf16 (2): 16-byte chunks are 8 halves; accumulate in
+                                // fp32 and repack so the raw-byte float4 add cannot corrupt the
+                                // packed bit patterns
+                                uint4* src = (uint4*) shbuf_stage_ptr(this_rank, stage_recv);
+                                uint4* dst = (uint4*) data_stage_ptr(recv_seg, stage_recv);
+                                if (dst + t < (uint4*) data_end)
+                                {
+                                    uint4 a = dst[t];
+                                    uint4 b = src[t];
+                                    if (dtype_flag == 1)
+                                    {
+                                        __half2* ah = (__half2*) &a;
+                                        __half2* bh = (__half2*) &b;
+                                        #pragma unroll
+                                        for (int k = 0; k < 4; ++k)
+                                        {
+                                            float2 af = __half22float2(ah[k]);
+                                            float2 bf = __half22float2(bh[k]);
+                                            af.x += bf.x; af.y += bf.y;
+                                            ah[k] = __float22half2_rn(af);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        __nv_bfloat162* ah = (__nv_bfloat162*) &a;
+                                        __nv_bfloat162* bh = (__nv_bfloat162*) &b;
+                                        #pragma unroll
+                                        for (int k = 0; k < 4; ++k)
+                                        {
+                                            float2 af = __bfloat1622float2(ah[k]);
+                                            float2 bf = __bfloat1622float2(bh[k]);
+                                            af.x += bf.x; af.y += bf.y;
+                                            ah[k] = __float22bfloat162_rn(af);
+                                        }
+                                    }
+                                    dst[t] = a;
+                                }
                             }
                         }
 
@@ -254,6 +300,12 @@ void pg_all_reduce
     size_t data_size = tensor.numel() * tensor.element_size();
     TORCH_CHECK(data_size % 16 == 0, "data_size must be multiple of 16");
 
+    int dtype_flag;
+    if (tensor.dtype() == at::kFloat) dtype_flag = 0;
+    else if (tensor.dtype() == at::kHalf) dtype_flag = 1;
+    else if (tensor.dtype() == at::kBFloat16) dtype_flag = 2;
+    else TORCH_CHECK(false, "pg_all_reduce: unsupported dtype (fp32/fp16/bf16)");
+
     uint32_t device_mask = 0;
     for (int i : devices) device_mask |= (1 << i);
     long num_ranks = devices.size();
@@ -272,6 +324,7 @@ void pg_all_reduce
         (void*)& shbuf_ptr,
         (void*)& data_size,
         (void*)& shbuf_size,
+        (void*)& dtype_flag,
         (void*)& abort_flag_ptr
     };
 

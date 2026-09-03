@@ -21,7 +21,10 @@ SHBUF_SIZE = 16 * 1024 ** 2
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
 SHBUF_SIZE_LL = 16 * 1024
-# MAX_CPU_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
+# Device-side ring all-reduce ceiling: payloads up to this size take the peer-shared-buffer
+# device path (pg_all_reduce); larger payloads fall back to CPU staging (pg_all_reduce_cpu).
+# Derived from the R buffer geometry (17 slots x 8 ring stages of the 256KB reduce chunk).
+MAX_DEVICE_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
 
 class TPBackend:
 
@@ -435,32 +438,44 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        # if tensor.numel() * 2 < MAX_CPU_REDUCE:
-        ext.pg_all_reduce_cpu(
-            self.ptr_g,
-            self.dev_g,
-            self.active_devices,
-            self.device,
-            self.active_devices[0],
-            tensor,
-            contribution,
-            self.dev_r,
-            SHBUF_SIZE_R,
-            self.master,
-            self.abort_flag
-        )
-        # else:
-        #     ext.pg_all_reduce(
-        #         self.ptr_g,
-        #         self.dev_g,
-        #         self.active_devices,
-        #         self.device,
-        #         self.active_devices[0],
-        #         tensor,
-        #         self.dev_b,
-        #         self.shbuf_size,
-        #         self.abort_flag
-        #     )
+        # Small payloads take the device-side ring reduce over the peer-shared B buffer: no host
+        # round trip, no CPU work -- the host-staged path costs a PCIe traversal plus a CPU
+        # reduction per collective, which dominated decode on PCIe rigs (the CPU reduce is also
+        # single-threaded AVX2 on many hosts). Above the threshold (or for contribution=False,
+        # which the device kernel does not implement, or non-float dtypes) the host path remains
+        # the fallback.
+        if (
+            contribution and
+            self.device >= 0 and
+            tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and
+            tensor.numel() * tensor.element_size() < MAX_DEVICE_REDUCE and
+            tensor.numel() * tensor.element_size() % 16 == 0
+        ):
+            ext.pg_all_reduce(
+                self.ptr_g,
+                self.dev_g,
+                self.active_devices,
+                self.device,
+                self.active_devices[0],
+                tensor,
+                self.dev_b,
+                self.shbuf_size,
+                self.abort_flag
+            )
+        else:
+            ext.pg_all_reduce_cpu(
+                self.ptr_g,
+                self.dev_g,
+                self.active_devices,
+                self.device,
+                self.active_devices[0],
+                tensor,
+                contribution,
+                self.dev_r,
+                SHBUF_SIZE_R,
+                self.master,
+                self.abort_flag
+            )
 
 
     def gather(
