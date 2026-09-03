@@ -83,6 +83,19 @@ class TPBackendNCCL:
             shbuf_size
         )
 
+        # e771c72 routed broadcast/gather through the native fallback to work around a Blackwell
+        # NCCL bug. The fallback stages through host shared memory, which is a poor fit for PCIe
+        # rigs (measured on 4x RTX 3090, PCIe Gen3 with P2P unlocked: NCCL broadcast/all_reduce
+        # at decode payload sizes is ~55 us, while the native path costs a CPU round trip per
+        # collective). Use the NCCL paths on everything except Blackwell (compute capability 10+).
+        try:
+            cap = torch.cuda.get_device_capability(device)
+            self.use_nccl_collectives = cap[0] < 10
+        except Exception:
+            self.use_nccl_collectives = False
+        if device >= 0:
+            log_tp(device, f"NCCL broadcast/gather: {'enabled' if self.use_nccl_collectives else 'native fallback (Blackwell)'}")
+
 
     def mp_warmup_nccl(self, device):
         """
@@ -111,9 +124,11 @@ class TPBackendNCCL:
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
-        self.fallback.broadcast(tensor, src_device)
-        # src_rank = self.active_devices.index(src_device)
-        # dist.broadcast(tensor, src = src_rank)
+        if self.use_nccl_collectives:
+            src_rank = self.active_devices.index(src_device)
+            dist.broadcast(tensor, src = src_rank)
+        else:
+            self.fallback.broadcast(tensor, src_device)
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
@@ -134,31 +149,33 @@ class TPBackendNCCL:
         out_device: int,
         ldims: list[int]
     ):
-        self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+        if not self.use_nccl_collectives:
+            self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
+            return
 
-        # dst_rank = self.active_devices.index(out_device)
-        # d_ldims = [0] * (max(self.active_devices) + 1)
-        # for d, m in zip(gather_devices, ldims):
-        #     d_ldims[d] = m
-        # ldims = [d_ldims[d] for d in self.active_devices]
-        #
-        # if self.rank == dst_rank:
-        #     od = 0
-        #     for src, ldim in enumerate(ldims):
-        #         if ldim == 0:
-        #             continue
-        #         out_slice = out_tensor[..., od : od + ldim]
-        #         od += ldim
-        #         if src == self.rank:
-        #             out_slice.copy(tensor)
-        #         else:
-        #             # print(f"rank {self.rank} recv {out_slice.shape[-1]} from {src}")
-        #             rbuf = torch.empty_like(out_slice)
-        #             dist.recv(rbuf, src = src)
-        #             out_slice.copy_(rbuf)
-        # elif tensor.shape[-1] > 0:
-        #     # print(f"rank {self.rank} send {tensor.shape[-1]} to {dst_rank}")
-        #     dist.send(tensor, dst = dst_rank)
+        # NCCL gather via point-to-point send/recv (pre-e771c72 implementation), restored for
+        # non-Blackwell devices
+        dst_rank = self.active_devices.index(out_device)
+        d_ldims = [0] * (max(self.active_devices) + 1)
+        for d, m in zip(gather_devices, ldims):
+            d_ldims[d] = m
+        ldims = [d_ldims[d] for d in self.active_devices]
+
+        if self.rank == dst_rank:
+            od = 0
+            for src, ldim in enumerate(ldims):
+                if ldim == 0:
+                    continue
+                out_slice = out_tensor[..., od : od + ldim]
+                od += ldim
+                if src == self.rank:
+                    out_slice.copy_(tensor)
+                else:
+                    rbuf = torch.empty_like(out_slice)
+                    dist.recv(rbuf, src = src)
+                    out_slice.copy_(rbuf)
+        elif tensor.shape[-1] > 0:
+            dist.send(tensor, dst = dst_rank)
 
 
     def gather_small(
