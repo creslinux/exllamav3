@@ -445,11 +445,20 @@ class TPBackendNative:
         # Small payloads take the device-side ring reduce over the peer-shared B buffer: no host
         # round trip, no CPU work -- the host-staged path costs a PCIe traversal plus a CPU
         # reduction per collective, which dominated decode on PCIe rigs (the CPU reduce is also
-        # single-threaded AVX2 on many hosts). Above the threshold (or for contribution=False,
-        # which the device kernel does not implement, or non-float dtypes) the host path remains
-        # the fallback.
+        # single-threaded AVX2 on many hosts). Above the threshold (or non-float dtypes) the host
+        # path remains the fallback.
+        # Routing MUST NOT depend on `contribution`: zero-width TP shards (e.g. attention layers
+        # whose 2 heads split 4-way as 0/1/1/0) call all_reduce(x, False) with a full-size zeros
+        # tensor while their siblings call it with contribution=True. Routing on contribution
+        # sends different ranks of the SAME collective into different kernels, and both sides
+        # wait for full participation -- deadlock. The ring handles contribution=False naturally:
+        # the zero shards stage their zeros and the sum is unchanged.
+        # EXL3_TP_DEVICE_REDUCE=0 forces every reduce onto the host path (upstream behaviour),
+        # used to isolate device-ring defects.
+        _no_device_reduce = os.environ.get("EXL3_TP_DEVICE_REDUCE", "1").lower() in ("", "0", "false", "no")
         if (
-            contribution and
+            not _no_device_reduce and
+            self.device >= 0 and
             self.device >= 0 and
             tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and
             tensor.numel() * tensor.element_size() < MAX_DEVICE_REDUCE and
