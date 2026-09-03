@@ -14,6 +14,7 @@
 #include "activation.cuh"
 #include "softcap.cuh"
 #include "routing.cuh"
+#include "moe_bounds.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
 
@@ -112,6 +113,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("routing_std", &routing_std, "routing_std");
+    m.def("moe_bounds", &moe_bounds, "moe_bounds");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");

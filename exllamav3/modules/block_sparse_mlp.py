@@ -1,9 +1,15 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import to2
+
+# Device-side expert bounds for the grouped MoE path (P1): replaces the
+# per-layer 513-int bincount .tolist() sync and the 512-iteration Python
+# skip loop with one kernel + a 2-int readback. See forward.
+P1_BOUNDS = os.environ.get("EXL3_P1_BOUNDS", "0").lower() not in ("", "0", "false", "no")
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
@@ -602,6 +608,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bcast_sel_bsz1 = None
         self.bcast_weights_bsz1 = None
 
+        # P1 device-side bounds scratch (allocated lazily per device)
+        self._p1_meta = None
+        self._p1_triples = None
+
         self.e_score_correction_bias = None
         self.e_score_correction_bias_key = key_e_score_bias
         self.tid2eid = None
@@ -1155,6 +1165,80 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # num_active -1 = unknown, kernel launches at max concurrency
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
                     run_fused(-1)
+                    expert_count_list = None
+                elif P1_BOUNDS and self.fused_mode_buffers is not None and num_ex <= 1024:
+                    # Device-side bounds: one kernel computes num_active and the packed
+                    # overflow work list; the host reads TWO ints instead of the full
+                    # 513-int histogram, and the per-expert Python loop below runs only
+                    # for genuine overflow experts (usually zero at prefill densities)
+                    if self._p1_meta is None or self._p1_meta.device != y.device:
+                        self._p1_meta = torch.zeros(2, dtype = torch.int32, device = y.device)
+                        self._p1_triples = torch.zeros((num_ex + 1) * 3, dtype = torch.int32, device = y.device)
+                    ext.moe_bounds(expert_count, self._p1_meta, self._p1_triples, TEMP_ROWS_FUSED)
+                    meta = self._p1_meta.tolist()
+                    run_fused(meta[0])
+                    overflow = self._p1_triples[:meta[1] * 3].tolist() if meta[1] else []
+
+                    out_state = None
+                    interm = None
+                    interm_a = None
+                    max_count = 0
+                    for t in range(0, len(overflow), 3):
+                        expert_idx = overflow[t]
+                        start = overflow[t + 1]
+                        count = overflow[t + 2]
+                        end = start + count
+
+                        top_x = token_sorted[start:end]
+                        w = weight_sorted[start:end].unsqueeze(1)
+
+                        current_state = y.index_select(0, top_x)
+
+                        if self.bc is not None and self.support_quant_paths:
+                            # Graph path
+                            if count <= TEMP_ROWS_GRAPH:
+                                self.bc.run_single_expert(current_state, expert_idx)
+                                current_state = self.experts_cfg.out_d2[:count]
+                            # DQ path
+                            else:
+                                if count > max_count:
+                                    out_state = torch.empty((count, self.hidden_size), dtype = torch.float, device = self.device)
+                                    interm = torch.empty((count * 2, self.intermediate_size_padded), dtype = self.interm_dtype, device = self.device)
+                                    interm_a = interm[:count] if self.interm_dtype == torch.half else \
+                                        torch.empty_like(interm[:count], dtype = torch.half)
+                                    out_state_ = out_state
+                                    interm_ = interm
+                                    interm_a_ = interm_a
+                                    max_count = count
+                                elif count == max_count:
+                                    out_state_ = out_state
+                                    interm_ = interm
+                                    interm_a_ = interm_a
+                                else:
+                                    out_state_ = out_state[:count]
+                                    interm_ = interm[:count * 2]
+                                    interm_a_ = interm_a[:count]
+
+                                yh = torch.empty((count * 2, self.hidden_size), dtype = torch.half, device = self.device)
+                                self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
+                                current_state = out_state_
+                        else:
+                            def mlp(exp_i, xc):
+                                u = self.ups[exp_i].forward(xc, params)
+                                if self.gated:
+                                    g = self.gates[exp_i].forward(xc, params)
+                                    a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                                    self.activation_fn_call(g, u, a, self.act_limit)
+                                else:
+                                    a = self.gateless_act(u)
+                                    if a.dtype != torch.half:
+                                        a = a.half()
+                                return self.downs[exp_i].forward(a, params)
+                            current_state = mlp(expert_idx, current_state)
+
+                        current_state.mul_(w)
+                        final_hidden_states.index_add_(0, top_x, current_state)
+
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
