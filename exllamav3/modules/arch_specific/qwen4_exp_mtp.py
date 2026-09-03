@@ -159,7 +159,7 @@ class Qwen4ExpMTPInputLayer(Module):
         else:
             sent = target.tp_producer.send(x)
             emb = target.tp_dispatch_master(mp_model_forward_embedding, (sent, params))
-        emb = self.pre_fc_norm_embedding.forward(emb.to(self.device), params)
+        emb = self.pre_fc_norm_embedding.forward(emb.to(self.device, torch.half), params)
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 
         if self.stream_tap:
