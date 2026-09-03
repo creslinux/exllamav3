@@ -235,6 +235,85 @@ class NGramEmbedding(Module):
     def weights_numel(self):
         return self.num_rows * ROW_DIM
 
+    def tp_export(self, plan, producer):
+        """
+        Export for TP: the table itself never moves. Disk-stream mode is required -- each worker
+        reconstructs its own DiskTensorHandle set (positioned reads over a shared fd), and the
+        OS page cache deduplicates the table across worker processes, so N ranks cost roughly
+        one table of host memory. Only the small host-side hash parameters travel through the
+        producer.
+        """
+        assert self.device is not None, "Cannot export module for TP before loading."
+        assert self.mode in ("trellis_disk", "fp16_disk"), \
+            ("TP load of a PLE model requires the n-gram table in disk-stream mode "
+             "(shared page cache across worker processes). Disable ngram_ram / enable "
+             "EXL3_NGRAM_STREAM before loading with tensor parallelism.")
+        return {
+            "cls": NGramEmbedding,
+            "kwargs": {
+                "key": self.key,
+                "ngram_size": self.ngram_size,
+                "heads_per_ngram": self.heads_per_ngram,
+                "ple_embed_dim": self.ple_embed_dim,
+                "eos_token_id": self.eos_token_id,
+                "stream_from_disk": True,
+                "out_dtype": self.out_dtype,
+            },
+            "mode": self.mode,
+            "K": self.K,
+            "rows_per_shard": self.rows_per_shard,
+            "num_rows": self.num_rows,
+            "row_dtype": str(self._row_dtype) if self._row_dtype is not None else None,
+            "head_offsets": producer.send(self.head_offsets),
+            "head_vocab_sizes": producer.send(self.head_vocab_sizes),
+            "layer_multipliers": producer.send(self.layer_multipliers),
+            "head_bias": producer.send(self.head_bias) if self.head_bias is not None else None,
+            "handles": [
+                {
+                    "key": h.key,
+                    "filename": h.filename,
+                    "abs_offset": h.abs_offset,
+                    "shape": h.shape,
+                    "dtype": str(h.dtype).replace("torch.", ""),
+                }
+                for h in self.handles
+            ],
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        module = NGramEmbedding(config = None, **exported["kwargs"])
+        module.device = device
+        module.mode = exported["mode"]
+        module.K = exported["K"]
+        module.rows_per_shard = exported["rows_per_shard"]
+        module.num_rows = exported["num_rows"]
+        rd = exported.get("row_dtype")
+        module._row_dtype = getattr(torch, rd) if rd else None
+        # The hashing parameters stay on the CPU (same as the non-TP load); only the dequant
+        # bias belongs on the device
+        module.head_offsets = consumer.recv(exported["head_offsets"]).long().contiguous()
+        module.head_vocab_sizes = consumer.recv(exported["head_vocab_sizes"]).long().contiguous()
+        module.layer_multipliers = consumer.recv(exported["layer_multipliers"]).long().contiguous()
+        bias_ref = exported.get("head_bias")
+        module.head_bias = consumer.recv(bias_ref).to(device) if bias_ref is not None else None
+        module.codebook = mul1_codebook(device) if module.mode == "trellis_disk" else None
+        module.handles = [
+            DiskTensorHandle(
+                key = h["key"],
+                filename = h["filename"],
+                abs_offset = h["abs_offset"],
+                shape = h["shape"],
+                dtype = getattr(torch, h["dtype"]),
+            )
+            for h in exported["handles"]
+        ]
+        torch.cuda.synchronize()
+        return module
+
     def _fetch_packed(self, uids_cpu: torch.Tensor) -> torch.Tensor:
         """Gather rows of the backing store (packed int16 or raw fp16/bf16) to CPU, routing
         global row indices to the individual shard tensors/handles."""

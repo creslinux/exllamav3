@@ -137,6 +137,12 @@ class PLELayer(Module):
         stream_from_disk: bool | None = None,
         out_dtype: torch.dtype | None = None,
         mm_token_id: int | None = None,
+        ple_embedding: Module | None = None,
+        key_proj: Module | None = None,
+        value_proj: Module | None = None,
+        norm_key: Module | None = None,
+        norm_query: Module | None = None,
+        norm_conv: Module | None = None,
     ):
         super().__init__(config = config, key = key, qmap = None)
         self.hidden_size = hidden_size
@@ -147,9 +153,10 @@ class PLELayer(Module):
         self.conv_state_len = (conv_kernel_size - 1) * self.conv_dilation
         self.gate_scale = 1.0 / math.sqrt(hidden_size)
         self.out_dtype = out_dtype
+        self.ple_embed_dim = ple_embed_dim
         hc_hidden = hc_mult * hidden_size
 
-        self.ple_embedding = NGramEmbedding(
+        self.ple_embedding = ple_embedding if ple_embedding is not None else NGramEmbedding(
             config = config,
             key = f"{key}.ple_embedding.ngram_embedding",
             ngram_size = ngram_size,
@@ -158,7 +165,7 @@ class PLELayer(Module):
             eos_token_id = eos_token_id,
             stream_from_disk = stream_from_disk,
         )
-        self.key_proj = Linear(
+        self.key_proj = key_proj if key_proj is not None else Linear(
             config = config,
             key = f"{key}.key_proj",
             in_features = ple_embed_dim,
@@ -166,7 +173,7 @@ class PLELayer(Module):
             qmap = qmap,
             out_dtype = torch.half,
         )
-        self.value_proj = Linear(
+        self.value_proj = value_proj if value_proj is not None else Linear(
             config = config,
             key = f"{key}.value_proj",
             in_features = ple_embed_dim,
@@ -179,9 +186,10 @@ class PLELayer(Module):
         def norm(name):
             return RMSNorm(config, f"{key}.{name}", rms_norm_eps, constant_bias = 1.0,
                            groups = hc_mult)
-        self.norm_key = norm("norm_key")
-        self.norm_query = norm("norm_query")
-        self.norm_conv = norm("norm_conv")
+        self.norm_key = norm_key if norm_key is not None else norm("norm_key")
+        self.norm_query = norm_query if norm_query is not None else norm("norm_query")
+        self.norm_conv = norm_conv if norm_conv is not None else norm("norm_conv")
+        self.rms_norm_eps = rms_norm_eps
         self.register_submodule(self.ple_embedding)
         self.register_submodule(self.key_proj)
         self.register_submodule(self.value_proj)
@@ -335,7 +343,10 @@ class PLELayer(Module):
         rsg = params.get("recurrent_states")
         if rsg:
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+            if getattr(rsg[0], "exported", False):
+                rsl = self.tp_recurrent_lookup[rsg[0].cache]
+            else:
+                rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, id_state = rsl.get_state_tensors()
             slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
             assert len(slots) == bsz
@@ -358,3 +369,109 @@ class PLELayer(Module):
             pad = ids.new_full((bsz, ctx), self.ple_embedding.eos_token_id)
             delta, _ = self.forward_streams(x, torch.cat((pad, ids), dim = 1), params)
         return x + delta
+
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
+        """
+        Everything the PLE layer contributes replicates per rank: the projections and norms are
+        small, and every rank must compute the identical PLE delta to add to its (replicated)
+        residual stream. Splitting value_proj's output would require an all-reduce per token for
+        no memory win. The n-gram table is host-side disk-streamed (shared page cache) and is
+        deliberately NOT counted against device storage.
+        """
+        from .module import TPAllocation
+        storage = 0
+        storage += self.key_proj.storage_size()
+        storage += self.value_proj.storage_size()
+        if self.norm_key is not None and not self.norm_key.unweighted:
+            storage += self.norm_key.weight.numel() * self.norm_key.weight.element_size()
+        if self.norm_query is not None and not self.norm_query.unweighted:
+            storage += self.norm_query.weight.numel() * self.norm_query.weight.element_size()
+        if self.norm_conv is not None and not self.norm_conv.unweighted:
+            storage += self.norm_conv.weight.numel() * self.norm_conv.weight.element_size()
+        if self.conv_w is not None:
+            storage += self.conv_w.numel() * self.conv_w.element_size()
+        for rl in self.recurrent_layers:
+            storage += rl.storage_size()
+        tpa = TPAllocation(
+            key = self.key,
+            storage_per_device = storage,
+        )
+        return [tpa]
+
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            if child is None:
+                return None
+            return child.tp_export(plan, producer)
+
+        return {
+            "cls": PLELayer,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "hc_mult": self.hc_mult,
+                "ple_embed_dim": self.ple_embed_dim,
+                "ngram_size": self.ple_embedding.ngram_size,
+                "heads_per_ngram": self.ple_embedding.heads_per_ngram,
+                "eos_token_id": self.ple_embedding.eos_token_id,
+                "conv_kernel_size": self.conv_kernel_size,
+                "rms_norm_eps": self.rms_norm_eps,
+                "mm_token_id": self.mm_token_id,
+                "out_dtype": self.out_dtype,
+            },
+            "ple_embedding": _export(self.ple_embedding),
+            "key_proj": _export(self.key_proj),
+            "value_proj": _export(self.value_proj),
+            "norm_key": _export(self.norm_key),
+            "norm_query": _export(self.norm_query),
+            "norm_conv": _export(self.norm_conv),
+            "conv_w": producer.send(self.conv_w) if self.conv_w is not None else None,
+            "device": self.device,
+            "recurrent_layers": [
+                rl.tp_export(plan) for rl in self.recurrent_layers
+            ]
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, **kwargs):
+        from .linear import Linear
+        from .rmsnorm import RMSNorm
+        device = local_context["device"]
+        consumer = local_context["consumer"]
+
+        def _import(name):
+            if exported.get(name):
+                return exported[name]["cls"].tp_import(local_context, exported[name], plan)
+            return None
+
+        def _import_replicated_linear(name):
+            # Replicated: split=None imports the projection whole
+            if exported.get(name):
+                return Linear.tp_import_split(local_context, exported[name], plan, None)
+            return None
+
+        module = PLELayer(
+            config = None,
+            **exported["kwargs"],
+            ple_embedding = _import("ple_embedding"),
+            key_proj = _import_replicated_linear("key_proj"),
+            value_proj = _import_replicated_linear("value_proj"),
+            norm_key = _import("norm_key"),
+            norm_query = _import("norm_query"),
+            norm_conv = _import("norm_conv"),
+        )
+        module.device = device
+        if exported.get("conv_w") is not None:
+            module.conv_w = consumer.recv(exported["conv_w"], cuda = True)
+
+        for rl in exported["recurrent_layers"]:
+            rli = rl["cls"](module = module, **rl["args"])
+            rli.alloc(device)
+            module.recurrent_layers.append(rli)
+            module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
+
+        torch.cuda.synchronize()
+        return module
