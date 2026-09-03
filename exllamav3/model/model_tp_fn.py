@@ -285,6 +285,7 @@ def mp_model_forward_lm_head_argmax(
     offset: int,
     gather_devices: list[int] | None,
     ldims: list[int] | None,
+    vocab_size: int | None = None,
 ):
     consumer = local_context["inf_consumer"]
     device = local_context["device"]
@@ -297,6 +298,13 @@ def mp_model_forward_lm_head_argmax(
         module = local_context["logits_module"]
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
+        # The lm_head is padded to the shard width; padded columns are live values and could
+        # otherwise win the sharded argmax. The owning (last) shard masks its tail to -inf
+        # before the local max, so the global winner is always a real vocabulary entry.
+        if vocab_size is not None:
+            local_vocab = vocab_size - offset
+            if local_vocab < x.shape[-1]:
+                x[..., local_vocab:] = float("-inf")
         v, i = x.max(dim = -1)
         i += offset
     else:

@@ -347,7 +347,7 @@ class Model_TPMixin:
         return r
 
 
-    def tp_dispatch_lm_head_argmax(self, args, return_values = False):
+    def tp_dispatch_lm_head_argmax(self, args, return_values = False, vocab_size = None):
         """
         Compute argmax over a tensor-parallel sharded LM head. With return_values, also returns
         the winning logit value (the draft-confidence path needs the max value, not just the
@@ -370,7 +370,7 @@ class Model_TPMixin:
             v, i = self.tp_worker_dispatch_single(
                 self.tp_output_device,
                 mp_model_forward_lm_head_argmax,
-                args + (ad[self.tp_output_device], None, None)
+                args + (ad[self.tp_output_device], None, None, vocab_size)
             )
             return i
 
@@ -383,7 +383,7 @@ class Model_TPMixin:
                 self.tp_worker_dispatch(
                     device,
                     mp_model_forward_lm_head_argmax,
-                    args + (ad.get(device, -1), gd, ldims)
+                    args + (ad.get(device, -1), gd, ldims, vocab_size)
                 )
                 dispatched.append(device)
 

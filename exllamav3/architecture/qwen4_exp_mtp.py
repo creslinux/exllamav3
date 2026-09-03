@@ -177,12 +177,14 @@ class Qwen4ExpMTPModel(Model):
             # The shared lm_head is sharded across ranks: ship the collapsed state to the
             # workers and take the sharded argmax (qwen3_5 MTP pattern). With draft
             # confidence enabled, also return the winning logit value.
+            vocab_size = target.config.vocab_size
             sent = target.tp_producer.send(state)
             if params.get("export_draft_conf"):
-                argmax, max_vals = target.tp_dispatch_lm_head_argmax((sent, {}), return_values = True)
+                argmax, max_vals = target.tp_dispatch_lm_head_argmax(
+                    (sent, {}), return_values = True, vocab_size = vocab_size)
                 params["draft_conf"] = max_vals
                 return argmax
-            return target.tp_dispatch_lm_head_argmax((sent, {}))
+            return target.tp_dispatch_lm_head_argmax((sent, {}), vocab_size = vocab_size)
         ll = target.logit_layer_idx
         lm = target.modules[ll]
         logits = lm.prepare_for_device(state, params)
