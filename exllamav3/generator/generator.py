@@ -2,12 +2,19 @@ from __future__ import annotations
 import logging
 import os
 import torch
+
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
+
+logger = logging.getLogger(__name__)
+
+# Lag-1 draft windowing + genuinely pinned draft staging (EXL3_D2_LAG1=1): see
+# iterate_draftmodel_mtp_gen
+D2_LAG1 = os.environ.get("EXL3_D2_LAG1", "0").lower() not in ("", "0", "false", "no")
 
 logger = logging.getLogger(__name__)
 from ..util.memory import malloc_trim
@@ -212,13 +219,17 @@ class Generator:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
-                pin_memory = False
+                # Genuinely pinned under EXL3_D2_LAG1: per-step D2H staging becomes
+                # non_blocking instead of a pipeline drain per drafted token
+                pin_memory = D2_LAG1
             )
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, self.num_draft_tokens),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = D2_LAG1
             )
+            self.draft_conf_pinned = None
+            self._lag1_window = None
 
         # CPU page cache tier
         self.cpu_page_cache = None
@@ -606,6 +617,36 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
+    def _draft_conf_stage(self, batch_size: int, window: int):
+        """
+        (Re)allocate the pinned confidence staging buffer for this round.
+        """
+        if (self.draft_conf_pinned is None or
+                self.draft_conf_pinned.shape[0] < batch_size or
+                self.draft_conf_pinned.shape[1] < window):
+            self.draft_conf_pinned = torch.empty(
+                (max(batch_size, 16), max(window, self.num_draft_tokens or window)),
+                dtype = torch.float32,
+                pin_memory = True,
+            )
+        return self.draft_conf_pinned
+
+    def confidence_window_cut(self, conf_host: torch.Tensor, cal, window: int) -> int:
+        """
+        Host-side confidence truncation over a whole drafted window. Reproduces the
+        sequential drafting break exactly: drafting stopped after step idx once
+        every row's running product of estimated conditional acceptance
+        probabilities ("reach") fell below the calibrator confidence, keeping the
+        first low-confidence token as the label probe.
+        """
+        reach = None
+        for idx in range(window):
+            est = [cal.estimate(v) for v in conf_host[:, idx].tolist()]
+            reach = est if reach is None else [r * e for r, e in zip(reach, est)]
+            if idx + 1 < window and max(reach) < cal.confidence:
+                return idx + 1
+        return window
+
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
@@ -652,6 +693,55 @@ class Generator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+
+        # Lag-1 path (EXL3_D2_LAG1): no per-step host reads at all. Draft exactly the
+        # window the previous round's calibrated cut allows (adaptive with a one-round
+        # lag; the calibrator is itself adaptive and lagging by nature), stage ids and
+        # confidence into pinned buffers with non_blocking copies, then ONE drain after
+        # the loop to read both and compute this round's cut for the next window. This
+        # keeps the compute saving of the in-loop break (no forwards beyond a sagging
+        # window, approximately) while removing the ~num_draft_tokens pipeline drains
+        # the per-step pageable copies paid.
+        if D2_LAG1:
+            window = self.num_draft_tokens if self._lag1_window is None else \
+                max(1, min(self._lag1_window, self.num_draft_tokens))
+            cal = self.draft_calibrator
+            if cal is not None:
+                conf_pinned = self._draft_conf_stage(batch_size, window)
+            for idx in range(window):
+                params = {
+                    "target_hidden": temp_hidden,
+                    "attn_mode": "flash_attn",
+                    "block_table": block_index,
+                    "cache": self.draft_cache,
+                    "cache_seqlens": cache_seqlens,
+                }
+                if cal is not None:
+                    params["export_draft_conf"] = True
+                batch_state = self.draft_model.forward(batch_ids, params)
+                lm_head = self.model.modules[self.model.logit_layer_idx]
+                batch_state = lm_head.prepare_for_device(batch_state, params)
+                new_ids = self.draft_model.sample_from_state(batch_state, params)
+                self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids, non_blocking = True)
+                draft_conf = params.get("draft_conf")
+                if cal is not None and draft_conf is not None:
+                    conf_pinned[:batch_size, idx:idx+1].copy_(
+                        draft_conf.reshape(batch_size, 1).float(), non_blocking = True
+                    )
+                batch_ids.copy_(new_ids)
+                cache_seqlens += 1
+                temp_hidden = batch_state
+
+            torch.cuda.synchronize()
+            if cal is not None:
+                # Labels cover the full drafted window, as upstream: verify may accept
+                # beyond any confidence cut, and the label index runs to accepted-1
+                self._draft_conf_round = {
+                    "ids": self.draft_ids_pinned[:batch_size, :window],
+                    "conf": self.draft_conf_pinned[:batch_size, :window].clone(),
+                    "window": window,
+                }
+            return self.draft_ids_pinned[:, :window]
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
@@ -1197,6 +1287,14 @@ class Generator:
         # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.mtp_draft:
+            # Lag-1 window feedback (EXL3_D2_LAG1): next round drafts one step past
+            # this round's best-accepting row -- the optimal restart point for
+            # speculative decoding. Clamped to [1, num_draft_tokens].
+            if D2_LAG1 and accepted_lengths:
+                self._lag1_window = max(
+                    1,
+                    min(max(accepted_lengths) + 1, self.num_draft_tokens)
+                )
             target_hidden = p_export_states[-1]
             accepted_idx = 0
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
