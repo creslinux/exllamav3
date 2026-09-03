@@ -372,6 +372,8 @@ class Model_TPMixin:
                 mp_model_forward_lm_head_argmax,
                 args + (ad[self.tp_output_device], None, None, vocab_size)
             )
+            if return_values:
+                return i, v
             return i
 
         gd = sorted(set(ad.keys()) | {self.tp_output_device})
