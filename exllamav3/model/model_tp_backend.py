@@ -166,6 +166,9 @@ class TPBackendNCCL:
         # assembled in exactly that order -- the same order the native pg_gather kernel uses.
         # Do NOT reorder into active_devices order: active_devices keeps the output device
         # last, so reordering would permute the concatenated slices.
+        if gather_devices is not None:
+            assert list(gather_devices) == sorted(gather_devices), \
+                "NCCL gather contract violated: gather_devices must arrive in sorted device order"
         dst_rank = self.active_devices.index(out_device)
 
         if self.rank == dst_rank:
