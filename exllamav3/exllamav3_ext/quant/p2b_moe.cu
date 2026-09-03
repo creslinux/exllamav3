@@ -177,7 +177,7 @@ __device__ __forceinline__ void run_gemv_tile(
     __syncthreads();
 }
 
-template <int BITS>
+template <int BITS, int CB>
 __global__ __launch_bounds__(512)
 void p2b_moe_batched_kernel(
     const half* __restrict__ x,          // (m, hidden)
@@ -263,7 +263,7 @@ void p2b_moe_batched_kernel(
             const half2* A2 = reinterpret_cast<const half2*>((is_up ? had_up : had_gate) + (size_t) s * hidden);
             half* C = (is_up ? up : gate) + (size_t) s * inter;
 
-            run_gemv_tile<BITS, 1, 0>(B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
+            run_gemv_tile<BITS, CB, 0>(B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
         }
         grid.sync();
     }
@@ -330,7 +330,7 @@ void p2b_moe_batched_kernel(
             const half2* A2 = reinterpret_cast<const half2*>(had_down + (size_t) s * inter);
             half* C = down + (size_t) s * hidden;
 
-            run_gemv_tile<BITS, 1, 0>(B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
+            run_gemv_tile<BITS, CB, 0>(B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
         }
         grid.sync();
     }
@@ -370,7 +370,7 @@ void p2b_moe_batched_kernel(
     }
 }
 
-template <int BITS>
+template <int BITS, int CB>
 static void launch_moe_batched(
     const at::Tensor& x, const at::Tensor& gt, const at::Tensor& gu,
     const at::Tensor& gv, const at::Tensor& ut, const at::Tensor& uu,
@@ -384,7 +384,7 @@ static void launch_moe_batched(
     int dev = 0, sms = 0, resident = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    void* kernel = (void*) p2b_moe_batched_kernel<BITS>;
+    void* kernel = (void*) p2b_moe_batched_kernel<BITS, CB>;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, 512, 0);
     const int grid = std::max(1, resident * sms);
 
@@ -437,7 +437,8 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
 {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "p2b fused MoE requires CUDA fp16 input");
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "p2b fused MoE output must be CUDA fp16");
-    TORCH_CHECK(mcg && kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
+    TORCH_CHECK(kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
+    const int cb = mcg ? 1 : 0;  // codebook select: 1 = MCG, 0 = mul1
     TORCH_CHECK(hidden % 128 == 0 && inter % 128 == 0, "p2b fused MoE requires hidden/inter divisible by 128");
     const int slots = static_cast<int>(ids.numel());
     const int m = static_cast<int>(x.numel() / x.size(-1));
@@ -450,9 +451,11 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     auto had_down = at::empty({slots, inter}, x.options());
     auto accum = at::zeros({m, hidden}, x.options().dtype(at::kFloat));
 
-    if (kg == 2) launch_moe_batched<2>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter);
-    else if (kg == 3) launch_moe_batched<3>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter);
-    else if (kg == 4) launch_moe_batched<4>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter);
+    #define P2B_DISPATCH(BITS, CB) launch_moe_batched<BITS, CB>(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rows, rw, out, gate, up, down, had_gate, had_up, had_down, accum, slots, m, hidden, inter)
+    if (kg == 4) { if (cb) P2B_DISPATCH(4, 1); else P2B_DISPATCH(4, 0); }
+    else if (kg == 3) { if (cb) P2B_DISPATCH(3, 1); else P2B_DISPATCH(3, 0); }
+    else if (kg == 2) { if (cb) P2B_DISPATCH(2, 1); else P2B_DISPATCH(2, 0); }
+    #undef P2B_DISPATCH
 
     return out;
 }
