@@ -110,7 +110,11 @@ class GDNState:
                 self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
             ))
         else:
-            self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
+            # Deferred: the children rewind concurrently with the parent-side draft round; the
+            # acks drain at the next forward dispatch, which orders the rewind ahead of it
+            self.cache.model.tp_dispatch_all_deferred(
+                mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens)
+            )
         self.position -= num_tokens
         self.last_history = 0
 

@@ -338,6 +338,24 @@ class Model_TPMixin:
             self.tp_worker_result(device)
 
 
+    def tp_dispatch_all_deferred(self, func, args):
+        """
+        Dispatch to every active TP device without waiting for child acks. The inline output-device
+        worker runs synchronously inside the loop; the children's acks join tp_pending_acks and drain
+        at the next dispatch (tp_drain_acks), overlapping the child work with parent-side execution.
+
+        Only safe when nothing reads the workers' affected state before the next dispatch: the next
+        tp_worker_dispatch drains the acks first, so ordering against subsequent commands holds.
+        Used by the recurrent-state rewind, which sits between the verify accept and the next draft
+        round -- with a co-located draft that whole stretch is parent-local.
+        """
+        for device in self.active_devices:
+            self.tp_worker_dispatch(device, func, args)
+        # Children ack the deferred command; the -1 CPU helper is never sent tp_dispatch_all
+        # commands (only the pump dispatch in forward_tp addresses it), so it is not pending here
+        self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
+
+
     def tp_dispatch_master(self, func, args):
         """
         Run a worker function only on the TP output device and return its result.
