@@ -667,6 +667,10 @@ class Model_TPMixin:
         # Shared pre-pickled command bytes for child ranks, as in prefill_tp
         args = (x, params, last_kv_module_idx, False, None)
         msg = ForkingPickler.dumps((mp_model_forward, args))
+        _tr_parent = None
+        if os.environ.get("EXL3_TP_TRACE_STEP", "0").lower() in ("1", "true", "yes"):
+            import time as _time
+            _tr_parent = (_time.perf_counter(), {"dispatch": 0.0, "result": 0.0})
         for device in self.active_devices:
             if device == self.tp_output_device:
                 self.tp_worker_dispatch(device, mp_model_forward, args)
@@ -676,7 +680,15 @@ class Model_TPMixin:
         # is already buffered. The child ranks' None acks (and the CPU helper's) are left in flight
         # and drained at the next dispatch, letting the caller queue sampling work on the output
         # device while the child processes finish their module walks
+        if _tr_parent is not None:
+            _tr_parent[1]["dispatch"] = _time.perf_counter() - _tr_parent[0]
+            _tr_t0 = _time.perf_counter()
         out = self.tp_worker_result(self.tp_output_device)
+        if _tr_parent is not None:
+            _tr_parent[1]["result"] = _time.perf_counter() - _tr_t0
+            print(f" ## TRACE parent: dispatch(incl inline worker) "
+                  f"{_tr_parent[1]['dispatch']*1000:.3f}ms result-wait "
+                  f"{_tr_parent[1]['result']*1000:.3f}ms", flush = True)
         assert out is not None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
         self.tp_pending_acks.append(-1)

@@ -15,6 +15,27 @@ from ..util import log_tp, set_t0
 
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
 
+# Per-class worker-loop timing probe (EXL3_TP_TRACE_STEP=1). On non-prefill full-module passes,
+# brackets each module with CUDA events and Python timers, splits by layer class, and prints a
+# running summary every _TRACE_EVERY traced passes (after _TRACE_SKIP warmup passes). The
+# per-class Python time is launch/issuance cost; the per-class CUDA-event time is GPU-side
+# occupancy of that module's kernel range. Also reports the block-graph capture count.
+_trace_step = os.environ.get("EXL3_TP_TRACE_STEP", "0").lower() in ("1", "true", "yes")
+_TRACE_SKIP = 20
+_TRACE_EVERY = 30
+_tr = {"n": 0, "py": {}, "gpu": {}, "loop_py": 0.0}
+
+def _trace_class(module):
+    name = type(module).__name__
+    if name == "TransformerBlock":
+        a = getattr(module, "attn", None)
+        an = type(a).__name__ if a is not None else ""
+        if an == "GatedDeltaNet": return "gdn"
+        if an: return "attn"
+        return "block_noattn"
+    if name == "OutputGather": return "gather"
+    return "other"
+
 
 from ..util.misc import install_parent_death_signal
 
@@ -249,18 +270,67 @@ def mp_model_forward(
 
     x = consumer.recv(shared_input)
 
-    for idx, module in enumerate(modules):
-        logits_layer = module.caps.get("logits_output")
-        if logits_layer and (num := params.get("last_tokens_only")):
-            x = x[..., -num:, :].contiguous()
-        if prefill:
-            params["prefill"] = (idx == last_kv_module_idx)
-        x = module.prepare_for_device(x, params)
-        x = module.forward(x, params)
-        if prefill and idx == last_kv_module_idx:
-            backend.end_cpu_reduce_jobs()
-            del params["prefill"]
-            return None
+    tracing = (
+        _trace_step and not prefill and single_idx is None and
+        local_context.get("device") == local_context.get("output_device") and
+        _tr["n"] < _TRACE_SKIP + _TRACE_EVERY
+    )
+    if tracing and _tr["n"] >= _TRACE_SKIP:
+        import time as _time
+        evs = []
+        py = {}
+        t_loop0 = _time.perf_counter()
+        for idx, module in enumerate(modules):
+            logits_layer = module.caps.get("logits_output")
+            if logits_layer and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
+            cls = _trace_class(module)
+            e0 = torch.cuda.Event(enable_timing = True); e0.record()
+            t0 = _time.perf_counter()
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+            py[cls] = py.get(cls, 0.0) + _time.perf_counter() - t0
+            e1 = torch.cuda.Event(enable_timing = True); e1.record()
+            evs.append((cls, e0, e1))
+        torch.cuda.synchronize()
+        t_loop1 = _time.perf_counter()
+        for cls, e0, e1 in evs:
+            _tr["gpu"][cls] = _tr["gpu"].get(cls, 0.0) + e0.elapsed_time(e1)
+        for cls, v in py.items():
+            _tr["py"][cls] = _tr["py"].get(cls, 0.0) + v
+        _tr["loop_py"] += t_loop1 - t_loop0
+        _tr["n"] += 1
+        if _tr["n"] == _TRACE_SKIP + _TRACE_EVERY:
+            n = _TRACE_EVERY
+            parts = []
+            for cls in sorted(set(_tr["py"]) | set(_tr["gpu"])):
+                p = _tr["py"].get(cls, 0.0) / n
+                g = _tr["gpu"].get(cls, 0.0) / n
+                parts.append(f"{cls}: py {p*1000:6.3f}ms gpu {g:6.3f}ms")
+            try:
+                from ..modules import block_graph as _bg
+                cap = f" | block_graphs={len(_bg._graphs)}"
+            except Exception:
+                cap = ""
+            print(f" ## TRACE pass avg x{n} (output-device worker): "
+                  f"loop_py {_tr['loop_py']/n*1000:.3f}ms | " + " | ".join(parts) + cap,
+                  flush = True)
+    else:
+        if tracing:
+            # skip-phase pass: advance the counter without tracing
+            _tr["n"] += 1
+        for idx, module in enumerate(modules):
+            logits_layer = module.caps.get("logits_output")
+            if logits_layer and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
+            if prefill:
+                params["prefill"] = (idx == last_kv_module_idx)
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+            if prefill and idx == last_kv_module_idx:
+                backend.end_cpu_reduce_jobs()
+                del params["prefill"]
+                return None
 
     backend.end_cpu_reduce_jobs()
     return x
