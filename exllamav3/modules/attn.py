@@ -1005,8 +1005,20 @@ class Attention(Module):
         storage += self.k_proj.storage_size()
         storage += self.v_proj.storage_size() if self.v_proj else 0
         storage += self.o_proj.storage_size()
+        # QSA indexer replicates fully on every rank (single raw key head; identical block
+        # selection required per rank), and so do its cache side planes (raw_k + pooled)
+        storage_per_device = 0
+        from ..cache.qsa import CacheLayer_qsa
         for cl in self.cache_layers:
-            storage += cl.storage_size()
+            if isinstance(cl, CacheLayer_qsa):
+                storage_per_device += cl.storage_size()
+            else:
+                storage += cl.storage_size()
+        if self.qsa_indexer is not None:
+            storage_per_device += self.qsa_indexer.index_qk_proj.storage_size()
+            for norm in (self.qsa_indexer.q_layernorm, self.qsa_indexer.k_layernorm):
+                if norm is not None and not norm.unweighted:
+                    storage_per_device += norm.weight.numel() * norm.weight.element_size()
         overhead_d = 0
         overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
         overhead_s = 0
@@ -1034,7 +1046,7 @@ class Attention(Module):
             key = self.key,
             channel_width = channel_width,
             channel_unit = "heads",
-            storage_per_device = 0,
+            storage_per_device = storage_per_device,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
@@ -1086,6 +1098,7 @@ class Attention(Module):
                 "kv_proj",
                 "o_proj",
                 "g_proj",
+                "qsa_indexer",
             )},
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
@@ -1165,6 +1178,7 @@ class Attention(Module):
             kv_proj = _import_split("kv_proj", kv_split),
             o_proj = _import_split("o_proj", o_split),
             g_proj = _import_split("g_proj", qh_split),
+            qsa_indexer = _import("qsa_indexer"),
         )
 
         # Attention sinks are one logit per query head; each rank keeps its local head range

@@ -53,6 +53,9 @@ class QSAIndexer(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         qbits_key: str = "bits",
+        index_qk_proj: Module | None = None,
+        q_layernorm: Module | None = None,
+        k_layernorm: Module | None = None,
     ):
         super().__init__(config = config, key = key, qmap = None)
         assert kv_heads == 1, "QSAIndexer assumes a single raw key head"
@@ -63,8 +66,10 @@ class QSAIndexer(Module):
         self.compress_ratio = compress_ratio
         self.block_topk = token_budget // compress_ratio
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.rms_norm_eps = rms_norm_eps
+        self.out_dtype = out_dtype
 
-        self.index_qk_proj = Linear(
+        self.index_qk_proj = index_qk_proj if index_qk_proj is not None else Linear(
             config = config,
             key = f"{key}.index_qk_proj",
             in_features = hidden_size,
@@ -73,11 +78,59 @@ class QSAIndexer(Module):
             out_dtype = torch.half,
             qbits_key = qbits_key,
         )
-        self.q_layernorm = RMSNorm(config, f"{key}.q_layernorm", rms_norm_eps, constant_bias = 1.0)
-        self.k_layernorm = RMSNorm(config, f"{key}.k_layernorm", rms_norm_eps, constant_bias = 1.0)
+        self.q_layernorm = q_layernorm if q_layernorm is not None else \
+            RMSNorm(config, f"{key}.q_layernorm", rms_norm_eps, constant_bias = 1.0)
+        self.k_layernorm = k_layernorm if k_layernorm is not None else \
+            RMSNorm(config, f"{key}.k_layernorm", rms_norm_eps, constant_bias = 1.0)
         self.register_submodule(self.index_qk_proj)
         self.register_submodule(self.q_layernorm)
         self.register_submodule(self.k_layernorm)
+
+    def tp_export(self, plan, producer):
+        """
+        The indexer replicates fully on every rank: the raw key head is single (kv_heads == 1,
+        cannot be split) and every rank must compute the identical block selection for its
+        local KV shard, so the scores are simply duplicated rather than split and reduced.
+        """
+        assert self.device is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": QSAIndexer,
+            "kwargs": {
+                "key": self.key,
+                "hidden_size": self.hidden_size,
+                "n_heads": self.n_heads,
+                "kv_heads": 1,
+                "head_dim": self.head_dim,
+                "token_budget": self.token_budget,
+                "compress_ratio": self.compress_ratio,
+                "rms_norm_eps": self.rms_norm_eps,
+                "out_dtype": self.out_dtype,
+            },
+            "index_qk_proj": self.index_qk_proj.tp_export(plan, producer),
+            "q_layernorm": self.q_layernorm.tp_export(plan, producer),
+            "k_layernorm": self.k_layernorm.tp_export(plan, producer),
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        from .linear import Linear
+        from .rmsnorm import RMSNorm
+        device = local_context["device"]
+        # Replicated: split=None imports the projection whole (full width, no plan entry needed)
+        index_qk_proj = Linear.tp_import_split(local_context, exported["index_qk_proj"], plan, None)
+        q_layernorm = RMSNorm.tp_import(local_context, exported["q_layernorm"], plan)
+        k_layernorm = RMSNorm.tp_import(local_context, exported["k_layernorm"], plan)
+        module = QSAIndexer(
+            config = None,
+            **exported["kwargs"],
+            index_qk_proj = index_qk_proj,
+            q_layernorm = q_layernorm,
+            k_layernorm = k_layernorm,
+        )
+        module.device = device
+        torch.cuda.synchronize()
+        return module
 
     @override
     def optimizer_targets(self):
