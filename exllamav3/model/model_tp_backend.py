@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.distributed as dist
 import time
@@ -22,10 +21,6 @@ SHBUF_SIZE = 16 * 1024 ** 2
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
 SHBUF_SIZE_LL = 16 * 1024
-# Device-side ring all-reduce ceiling: payloads up to this size take the peer-shared-buffer
-# device path (pg_all_reduce); larger payloads fall back to CPU staging (pg_all_reduce_cpu).
-# Derived from the R buffer geometry (17 slots x 8 ring stages of the 256KB reduce chunk).
-MAX_DEVICE_REDUCE = SHBUF_SIZE_R // 17 // 256 * 256
 
 class TPBackend:
 
@@ -87,21 +82,12 @@ class TPBackendNCCL:
             shbuf_size
         )
 
-        # e771c72 routed broadcast/gather through the native fallback to work around a Blackwell
-        # NCCL bug. The fallback stages through host shared memory, which is a poor fit for PCIe
-        # rigs (measured on 4x RTX 3090, PCIe Gen3 with P2P unlocked: NCCL broadcast/all_reduce
-        # at decode payload sizes is ~55 us, while the native path costs a CPU round trip per
-        # collective). Use the NCCL paths on everything except Blackwell (compute capability 10+).
-        try:
-            cap = torch.cuda.get_device_capability(device)
-            self.use_nccl_collectives = cap[0] < 10
-        except Exception:
-            self.use_nccl_collectives = False
-        # Debug/isolation override: force broadcast/gather back to the native fallback
-        if os.environ.get("EXL3_TP_NCCL_P2P", "1").lower() in ("", "0", "false", "no"):
-            self.use_nccl_collectives = False
-        if device >= 0:
-            log_tp(device, f"NCCL broadcast/gather: {'enabled' if self.use_nccl_collectives else 'native fallback (Blackwell)'}")
+        # Broadcast/gather delegate to the native fallback, matching upstream. The pre-e771c72
+        # NCCL P2P implementation was restored briefly and measured on 4x RTX 3090 (PCIe Gen3,
+        # P2P unlocked): it lost to the fallback by ~8 ms per decode step -- unbatched
+        # dist.send/recv spawns a fresh 2-rank NCCL communicator per op, and the sequential
+        # transfers cost more than the shared-memory path. It also carried a slice-ordering
+        # trap (see git history). Deleted rather than kept behind a flag.
 
 
     def mp_warmup_nccl(self, device):
@@ -131,11 +117,7 @@ class TPBackendNCCL:
 
 
     def broadcast(self, tensor: torch.Tensor, src_device: int):
-        if self.use_nccl_collectives:
-            src_rank = self.active_devices.index(src_device)
-            dist.broadcast(tensor, src = src_rank)
-        else:
-            self.fallback.broadcast(tensor, src_device)
+        self.fallback.broadcast(tensor, src_device)
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
@@ -156,36 +138,7 @@ class TPBackendNCCL:
         out_device: int,
         ldims: list[int]
     ):
-        if not self.use_nccl_collectives:
-            self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
-            return
-
-        # NCCL gather via point-to-point send/recv (pre-e771c72 implementation), restored for
-        # non-Blackwell devices. The caller's contract (e.g. mp_model_append_gather) delivers
-        # gather_devices/ldims in sorted physical-device order and the output tensor must be
-        # assembled in exactly that order -- the same order the native pg_gather kernel uses.
-        # Do NOT reorder into active_devices order: active_devices keeps the output device
-        # last, so reordering would permute the concatenated slices.
-        if gather_devices is not None:
-            assert list(gather_devices) == sorted(gather_devices), \
-                "NCCL gather contract violated: gather_devices must arrive in sorted device order"
-        dst_rank = self.active_devices.index(out_device)
-
-        if self.rank == dst_rank:
-            od = 0
-            for dev, ldim in zip(gather_devices, ldims):
-                if ldim == 0:
-                    continue
-                out_slice = out_tensor[..., od : od + ldim]
-                od += ldim
-                if dev == out_device:
-                    out_slice.copy_(tensor)
-                else:
-                    rbuf = torch.empty_like(out_slice)
-                    dist.recv(rbuf, src = self.active_devices.index(dev))
-                    out_slice.copy_(rbuf)
-        elif tensor.shape[-1] > 0:
-            dist.send(tensor, dst = dst_rank)
+        self.fallback.gather(tensor, out_tensor, gather_devices, out_device, ldims)
 
 
     def gather_small(
@@ -229,11 +182,10 @@ class TPBackendNative:
         small buffer for tiny gathers. LL is dedicated to low-latency broadcasts so consumers can acknowledge and
         exit without blocking other collectives. CUDA workers register these buffers as pinned host memory.
 
-        all_reduce() routes small float payloads through the device-side ring over the B buffer
-        (pg_all_reduce) and everything else through pg_all_reduce_cpu(): GPU workers publish their
-        contributions into the R buffer, a designated CPU helper performs the reduction over host
-        memory, and workers copy the reduced result back. The CPU path avoids relying on NCCL for
-        the native backend, at the cost of PCIe traffic and CPU work.
+        all_reduce() routes through pg_all_reduce_cpu(): GPU workers publish their contributions
+        into the R buffer, a designated CPU helper performs the reduction over host memory, and
+        workers copy the reduced result back. This avoids relying on NCCL for the native backend,
+        at the cost of PCIe traffic and CPU work.
         """
 
         self.uuid = uuid
@@ -249,10 +201,6 @@ class TPBackendNative:
         self.master = master
         self.cpu = cpu
         self.cpu_is_pinned = False
-
-        # Debug/isolation override: EXL3_TP_DEVICE_REDUCE=0 forces every reduce onto the host path
-        # (upstream behaviour). Read once here -- all_reduce runs ~100x per forward pass.
-        self.no_device_reduce = os.environ.get("EXL3_TP_DEVICE_REDUCE", "1").lower() in ("", "0", "false", "no")
 
         size_g = GLOBALS_SIZE
         size_b = self.shbuf_size
@@ -451,52 +399,28 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        # Small payloads take the device-side ring reduce over the peer-shared B buffer: no host
-        # round trip, no CPU work -- the host-staged path costs a PCIe traversal plus a CPU
-        # reduction per collective, which dominated decode on PCIe rigs (the CPU reduce is also
-        # single-threaded AVX2 on many hosts). Above the threshold (or non-float dtypes, or
-        # non-contiguous tensors, which the ring kernel's flat addressing does not support) the
-        # host path remains the fallback.
-        # Routing MUST NOT depend on `contribution`: zero-width TP shards (e.g. attention layers
-        # whose 2 heads split 4-way as 0/1/1/0) call all_reduce(x, False) with a full-size zeros
-        # tensor while their siblings call it with contribution=True. Routing on contribution
-        # sends different ranks of the SAME collective into different kernels, and both sides
-        # wait for full participation -- deadlock. The ring handles contribution=False naturally:
-        # the zero shards stage their zeros and the sum is unchanged. Every input to the gate
-        # below (dtype, contiguity, size, alignment) is rank-uniform for a given collective.
-        if (
-            not self.no_device_reduce and
-            self.device >= 0 and
-            tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and
-            tensor.is_contiguous() and
-            tensor.numel() * tensor.element_size() < MAX_DEVICE_REDUCE and
-            tensor.numel() * tensor.element_size() % 16 == 0
-        ):
-            ext.pg_all_reduce(
-                self.ptr_g,
-                self.dev_g,
-                self.active_devices,
-                self.device,
-                self.active_devices[0],
-                tensor,
-                self.dev_b,
-                self.shbuf_size,
-                self.abort_flag
-            )
-        else:
-            ext.pg_all_reduce_cpu(
-                self.ptr_g,
-                self.dev_g,
-                self.active_devices,
-                self.device,
-                self.active_devices[0],
-                tensor,
-                contribution,
-                self.dev_r,
-                SHBUF_SIZE_R,
-                self.master,
-                self.abort_flag
-            )
+        # CPU-assisted path unconditionally, matching upstream: GPU workers stage into the R
+        # buffer, the -1 CPU helper reduces over host memory, workers copy the result back.
+        # The device-side ring (pg_all_reduce over the B buffer) was re-enabled briefly and
+        # measured on 4x RTX 3090 (PCIe Gen3, P2P unlocked): at decode payload sizes (5 KB fp16
+        # hidden states) it lost to this path by ~3.5 ms per decode step -- the ring pays
+        # 2*(N-1) latency-bound P2P hops per collective, while the CPU path's staged DMA +
+        # AVX reduce overruns it at this size. It also deadlocked when routed per-rank on
+        # `contribution` (zero-width shards). The kernel's fp16/bf16 accumulate fix in
+        # all_reduce.cu is kept for whenever the ring is revisited.
+        ext.pg_all_reduce_cpu(
+            self.ptr_g,
+            self.dev_g,
+            self.active_devices,
+            self.device,
+            self.active_devices[0],
+            tensor,
+            contribution,
+            self.dev_r,
+            SHBUF_SIZE_R,
+            self.master,
+            self.abort_flag
+        )
 
 
     def gather(
