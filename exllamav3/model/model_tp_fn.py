@@ -300,6 +300,8 @@ def mp_model_forward(
             _tr["py"][cls] = _tr["py"].get(cls, 0.0) + v
         _tr["loop_py"] += t_loop1 - t_loop0
         _tr["n"] += 1
+        if "qlen" not in _tr:
+            _tr["qlen"] = x.size(1)
         if _tr["n"] == _TRACE_SKIP + _TRACE_EVERY:
             n = _TRACE_EVERY
             parts = []
@@ -312,9 +314,12 @@ def mp_model_forward(
                 cap = f" | block_graphs={len(_bg._graphs)}"
             except Exception:
                 cap = ""
-            print(f" ## TRACE pass avg x{n} (output-device worker): "
+            print(f" ## TRACE pass avg x{n} qlen={_tr['qlen']} (output-device worker): "
                   f"loop_py {_tr['loop_py']/n*1000:.3f}ms | " + " | ".join(parts) + cap,
                   flush = True)
+            # re-arm: count, clear, keep capturing successive (warmer) windows
+            _tr.update({"n": 0, "py": {}, "gpu": {}, "loop_py": 0.0})
+            _tr.pop("qlen", None)
     else:
         if tracing:
             # skip-phase pass: advance the counter without tracing
