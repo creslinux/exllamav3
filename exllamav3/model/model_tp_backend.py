@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 import time
@@ -96,6 +97,9 @@ class TPBackendNCCL:
             self.use_nccl_collectives = cap[0] < 10
         except Exception:
             self.use_nccl_collectives = False
+        # Debug/isolation override: force broadcast/gather back to the native fallback
+        if os.environ.get("EXL3_TP_NCCL_P2P", "1").lower() in ("", "0", "false", "no"):
+            self.use_nccl_collectives = False
         if device >= 0:
             log_tp(device, f"NCCL broadcast/gather: {'enabled' if self.use_nccl_collectives else 'native fallback (Blackwell)'}")
 
@@ -157,25 +161,25 @@ class TPBackendNCCL:
             return
 
         # NCCL gather via point-to-point send/recv (pre-e771c72 implementation), restored for
-        # non-Blackwell devices
+        # non-Blackwell devices. The caller's contract (e.g. mp_model_append_gather) delivers
+        # gather_devices/ldims in sorted physical-device order and the output tensor must be
+        # assembled in exactly that order -- the same order the native pg_gather kernel uses.
+        # Do NOT reorder into active_devices order: active_devices keeps the output device
+        # last, so reordering would permute the concatenated slices.
         dst_rank = self.active_devices.index(out_device)
-        d_ldims = [0] * (max(self.active_devices) + 1)
-        for d, m in zip(gather_devices, ldims):
-            d_ldims[d] = m
-        ldims = [d_ldims[d] for d in self.active_devices]
 
         if self.rank == dst_rank:
             od = 0
-            for src, ldim in enumerate(ldims):
+            for dev, ldim in zip(gather_devices, ldims):
                 if ldim == 0:
                     continue
                 out_slice = out_tensor[..., od : od + ldim]
                 od += ldim
-                if src == self.rank:
+                if dev == out_device:
                     out_slice.copy_(tensor)
                 else:
                     rbuf = torch.empty_like(out_slice)
-                    dist.recv(rbuf, src = src)
+                    dist.recv(rbuf, src = self.active_devices.index(dev))
                     out_slice.copy_(rbuf)
         elif tensor.shape[-1] > 0:
             dist.send(tensor, dst = dst_rank)
