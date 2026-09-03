@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing_extensions import override
 import torch
 from ...model.config import Config
+from ...model.model_tp_fn import mp_model_forward_embedding
 from ...modules import Module, Linear, RMSNorm
 from ...util.tensor import get_for_device, to2
 
@@ -149,8 +150,15 @@ class Qwen4ExpMTPInputLayer(Module):
             * self.norm_hidden_w
         h = self.fc_hidden.forward(normed.half().contiguous(), params)         # (b, s, H, D)
 
-        # Token embedding via the attached model
-        emb = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+        # Token embedding via the attached model. Under TP the parent's module objects are
+        # never loaded (weights live in the workers), so ship the token ids through the
+        # producer and run the master worker's loaded embedding -- the DFlash draft pattern
+        target = self.attached_model()
+        if not target.loaded_tp:
+            emb = target.modules[0].forward(x, params, out_dtype = torch.half)
+        else:
+            sent = target.tp_producer.send(x)
+            emb = target.tp_dispatch_master(mp_model_forward_embedding, (sent, params))
         emb = self.pre_fc_norm_embedding.forward(emb.to(self.device), params)
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 

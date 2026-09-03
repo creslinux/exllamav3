@@ -646,8 +646,12 @@ class Generator:
             if cal is not None:
                 params["export_draft_conf"] = True
             batch_state = self.draft_model.forward(batch_ids, params)
+            # Move the state to the lm_head's device. Under TP the target's original lm_head
+            # module is unloaded (weights live in the workers) and sample_from_state performs
+            # its own device move before dispatching to the sharded head
             lm_head = self.model.modules[self.model.logit_layer_idx]
-            batch_state = lm_head.prepare_for_device(batch_state, params)
+            if not self.model.loaded_tp:
+                batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
