@@ -80,6 +80,9 @@ class Qwen4ExpMTPInputLayer(Module):
 
         # Populated by attach_to()
         self.attached_model = None
+        # Under TP, attach_to binds the inline worker's loaded embedding replica here so the
+        # token lookup is a local call instead of a producer round trip per drafted token
+        self.local_embed = None
 
         self.caps.update({"x_cpu": True})
 
@@ -151,14 +154,18 @@ class Qwen4ExpMTPInputLayer(Module):
         h = self.fc_hidden.forward(normed.half().contiguous(), params)         # (b, s, H, D)
 
         # Token embedding via the attached model. Under TP the parent's module objects are
-        # never loaded (weights live in the workers), so ship the token ids through the
-        # producer and run the master worker's loaded embedding -- the DFlash draft pattern
-        target = self.attached_model()
-        if not target.loaded_tp:
-            emb = target.modules[0].forward(x, params, out_dtype = torch.half)
+        # never loaded (weights live in the workers); attach_to binds the inline worker's
+        # loaded replica (local_embed), which is a local call. The producer dispatch is the
+        # DFlash-pattern fallback when no replica is bound.
+        if self.local_embed is not None:
+            emb = self.local_embed.forward(x, params, out_dtype = torch.half)
         else:
-            sent = target.tp_producer.send(x)
-            emb = target.tp_dispatch_master(mp_model_forward_embedding, (sent, params))
+            target = self.attached_model()
+            if not target.loaded_tp:
+                emb = target.modules[0].forward(x, params, out_dtype = torch.half)
+            else:
+                sent = target.tp_producer.send(x)
+                emb = target.tp_dispatch_master(mp_model_forward_embedding, (sent, params))
         emb = self.pre_fc_norm_embedding.forward(emb.to(self.device, torch.half), params)
         emb = self.fc_embedding.forward(emb, params)                           # (b, s, D)
 

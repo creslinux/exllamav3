@@ -121,6 +121,8 @@ class Qwen4ExpMTPModel(Model):
         self.target_embed = None
         self.target_lm_head = None
         self.attached_model = None
+        # Populated by attach_to() under TP: a full lm_head replica on the output device
+        self.local_head = None
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -138,13 +140,46 @@ class Qwen4ExpMTPModel(Model):
         self.input_layer.attached_model = weakref.ref(target)
         self.attached_model = weakref.ref(target)
 
-        target_embed = None
-        for m in target.modules:
-            if isinstance(m, Embedding):
-                target_embed = m
-                break
-        assert target_embed is not None, "Could not locate target's Embedding module"
-        self.target_embed = weakref.ref(target_embed)
+        if target.loaded_tp:
+            # Co-located draft under TP: bind the borrows to loaded tensors in this process so
+            # the drafting loop pays no producer round trip per token. The output-device inline
+            # worker runs in the main process and its module list holds a loaded replica of the
+            # replicated embedding. The sharded lm_head cannot be borrowed that way, so a full
+            # replica is loaded onto the output device from the stc (~0.48 GB; measured
+            # 2.69 GiB free on GPU 0 under the full TP4+MTP stack).
+            import torch as _torch
+            inline = target.mp_parent_conn[target.tp_output_device]
+            embed_replica = inline.local_context["modules"][0]
+            assert isinstance(embed_replica, Embedding), \
+                "Inline worker's module 0 is not the Embedding replica"
+            self.input_layer.local_embed = embed_replica
+            self.target_embed = weakref.ref(embed_replica)
+
+            free_b, _ = _torch.cuda.mem_get_info(target.tp_output_device)
+            head = Linear(
+                config = target.config,
+                key = "lm_head",
+                qbits_key = "head_bits",
+                in_features = target.config.hidden_size,
+                out_features = target.config.vocab_size,
+                qmap = "block",
+                caps = {"logits_output": True},
+            )
+            head.load(_torch.device(target.tp_output_device))
+            self.local_head = head
+            free_a, _ = _torch.cuda.mem_get_info(target.tp_output_device)
+            print(f" -- MTP co-location: local embedding bound, lm_head replica loaded "
+                  f"({(free_b - free_a)/1024**3:.2f} GiB on device {target.tp_output_device})",
+                  flush = True)
+        else:
+            target_embed = None
+            for m in target.modules:
+                if isinstance(m, Embedding):
+                    target_embed = m
+                    break
+            assert target_embed is not None, "Could not locate target's Embedding module"
+            self.target_embed = weakref.ref(target_embed)
+            self.local_head = None
 
         assert isinstance(target.modules[-1], Linear), "Expected Linear lm_head as last target module"
         self.target_lm_head = weakref.ref(target.modules[-1])
@@ -172,6 +207,18 @@ class Qwen4ExpMTPModel(Model):
         bsz, seq, _ = state.shape
         stack = state.to(mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
+        if self.local_head is not None:
+            # Co-located head replica (attach_to under TP): collapse, project and argmax
+            # locally on the output device -- no producer round trip per drafted token
+            logits = self.local_head.prepare_for_device(state, params)
+            logits = self.local_head.forward(logits, params)
+            logits = logits[..., :self.config.vocab_size]
+            if params.get("export_draft_conf"):
+                conf, ids = torch.max(logits, dim = -1)
+                params["draft_conf"] = conf
+                return ids
+            return torch.argmax(logits, dim = -1)
+
         target = self.attached_model()
         if target.loaded_tp:
             # The shared lm_head is sharded across ranks: ship the collapsed state to the
