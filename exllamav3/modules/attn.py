@@ -1016,9 +1016,12 @@ class Attention(Module):
                 storage += cl.storage_size()
         if self.qsa_indexer is not None:
             storage_per_device += self.qsa_indexer.index_qk_proj.storage_size()
+            # make_tp_allocation runs pre-load: read norm sizes from the safetensors metadata
+            # (the RMSNorm pattern), never from live tensors
+            stc = self.config.stc
             for norm in (self.qsa_indexer.q_layernorm, self.qsa_indexer.k_layernorm):
                 if norm is not None and not norm.unweighted:
-                    storage_per_device += norm.weight.numel() * norm.weight.element_size()
+                    storage_per_device += sum(stc.get_tensor_sizes(norm.key))
         overhead_d = 0
         overhead_d += self.hidden_size * (self.out_dtype or torch.half).itemsize
         overhead_s = 0

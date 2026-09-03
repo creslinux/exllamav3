@@ -379,19 +379,19 @@ class PLELayer(Module):
         deliberately NOT counted against device storage.
         """
         from .module import TPAllocation
+        # make_tp_allocation runs pre-load: read the small-weight sizes from the safetensors
+        # metadata (the RMSNorm pattern), never from live tensors
+        stc = self.config.stc
         storage = 0
         storage += self.key_proj.storage_size()
         storage += self.value_proj.storage_size()
-        if self.norm_key is not None and not self.norm_key.unweighted:
-            storage += self.norm_key.weight.numel() * self.norm_key.weight.element_size()
-        if self.norm_query is not None and not self.norm_query.unweighted:
-            storage += self.norm_query.weight.numel() * self.norm_query.weight.element_size()
-        if self.norm_conv is not None and not self.norm_conv.unweighted:
-            storage += self.norm_conv.weight.numel() * self.norm_conv.weight.element_size()
-        if self.conv_w is not None:
-            storage += self.conv_w.numel() * self.conv_w.element_size()
-        for rl in self.recurrent_layers:
-            storage += rl.storage_size()
+        hc_hidden = self.hc_mult * self.hidden_size
+        storage += sum(stc.get_tensor_sizes(self.norm_key.key)) if self.norm_key is not None else hc_hidden
+        storage += sum(stc.get_tensor_sizes(self.norm_query.key)) if self.norm_query is not None else hc_hidden
+        storage += sum(stc.get_tensor_sizes(self.norm_conv.key)) if self.norm_conv is not None else hc_hidden
+        storage += hc_hidden * self.conv_kernel_size  # conv1d weight (from weights_numel formula)
+        # Recurrent layers are not yet created pre-load; the state geometry is derivable
+        storage += 0  # state layers are allocated per-rank at tp_import (cache_id scoped)
         tpa = TPAllocation(
             key = self.key,
             storage_per_device = storage,
