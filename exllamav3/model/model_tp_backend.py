@@ -204,7 +204,7 @@ class TPBackendNative:
         self.cpu_is_pinned = False
 
         # One-shot all-reduce payload cap (wire bytes); 0 disables
-        self.oneshot_max = int(os.environ.get("EXL3_TP_ONESHOT_MAX", str(64 * 1024)))
+        self.oneshot_max = int(os.environ.get("EXL3_TP_ONESHOT_MAX", "0"))
 
         # Timing probe: EXL3_TP_STUB_COLLECTIVES=1 turns the data collectives into no-ops so the
         # forward can be timed without communication cost. Output is garbage; never use for
