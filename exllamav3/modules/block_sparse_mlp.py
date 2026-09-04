@@ -1027,32 +1027,41 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.p2b_ok = bool(ok)
         return self.p2b_ok
 
-    def _p2b_forward_bszn(self, y, bsz, selected_experts, routing_weights):
+    def _p2b_forward_bszn(self, y, x, bsz, selected_experts, routing_weights):
         mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
         E = self.num_local_experts
         topk = self.num_experts_per_tok
         n = bsz * topk
+        H, I = self.hidden_size, self.intermediate_size_padded
 
         if self.p2b_ids is None:
             cap = 16 * topk
-            self.p2b_ids = torch.empty(cap, dtype = torch.int32, device = self.device)
-            self.p2b_rw = torch.empty(cap, dtype = torch.half, device = self.device)
+            dev = self.device
+            self.p2b_ids = torch.empty(cap, dtype = torch.int32, device = dev)
+            self.p2b_rw = torch.empty(cap, dtype = torch.half, device = dev)
             self.p2b_rows = {}
-            self.p2b_out = torch.empty((16, self.hidden_size), dtype = torch.half, device = self.device)
+            self.p2b_out = torch.empty((16, H), dtype = torch.float, device = dev)
+            self.p2b_acc = torch.empty((16, H), dtype = torch.float, device = dev)
+            self.p2b_gate = torch.empty((cap, I), dtype = torch.half, device = dev)
+            self.p2b_up = torch.empty((cap, I), dtype = torch.half, device = dev)
+            self.p2b_down = torch.empty((cap, H), dtype = torch.half, device = dev)
+            self.p2b_hg = torch.empty((cap, H), dtype = torch.half, device = dev)
+            self.p2b_hu = torch.empty((cap, H), dtype = torch.half, device = dev)
+            self.p2b_hd = torch.empty((cap, I), dtype = torch.half, device = dev)
+            self.p2b_sh = None
+            # One-line engagement proof: the first call prints once per process. A path that
+            # silently never engaged has fooled this project's benches four times.
+            print(f" -- p2b MoE path engaged: {self.key}", flush = True)
         if bsz not in self.p2b_rows:
             self.p2b_rows[bsz] = torch.arange(bsz, device = self.device) \
                 .repeat_interleave(topk).to(torch.int32)
 
-        local = selected_experts.reshape(-1)
-        rw = routing_weights.reshape(-1)
-        if self.routing_first is not None and E != self.num_experts:
-            local = local - self.routing_first
-            valid = (local >= 0) & (local < E)
-            local = local.clamp(0, E - 1)
-            rw = rw * valid.to(torch.half)
+        first = self.routing_first if self.routing_first is not None else 0
+        ext.p2b_map_slots(
+            selected_experts.reshape(-1), routing_weights.reshape(-1),
+            self.p2b_ids[:n], self.p2b_rw[:n], first, E,
+        )
 
-        self.p2b_ids[:n].copy_(local.to(torch.int32))
-        self.p2b_rw[:n].copy_(rw)
         out = self.p2b_out[:bsz]
         ext.p2b_fused_moe(
             y, out,
@@ -1061,9 +1070,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh,
             self.p2b_ids[:n], self.p2b_rows[bsz], self.p2b_rw[:n],
             mg.K, mg.K, mg.K, bool(mg.mcg), bool(mg.mul1),
-            self.hidden_size, self.intermediate_size_padded,
+            H, I,
+            self.p2b_gate[:n], self.p2b_up[:n], self.p2b_down[:n],
+            self.p2b_hg[:n], self.p2b_hu[:n], self.p2b_hd[:n],
+            self.p2b_acc[:bsz],
         )
-        return out.float().view((bsz, self.hidden_size))
+
+        # Shared expert through its own multi-row graph + the sigmoid-gate combine, replacing
+        # the eager tail (~100-150 us/layer) with ~25 us + one combine kernel. Falls back to
+        # the common tail when the shared BC was not bound.
+        if self.bc_sh_exp:
+            if self.p2b_sh is None:
+                self.p2b_sh = torch.empty((1, 16, H), dtype = torch.float, device = self.device)
+            self.shared_experts.bc.run_bszN(y.view(1, bsz, H), self.p2b_sh[:, :bsz])
+            ext.add_sigmoid_gate_proj(
+                self.p2b_sh[0, :bsz], x.view(-1, H), out, self.shared_gate.inner.weight,
+            )
+
+        return out
 
     @override
     def forward(
@@ -1317,10 +1341,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # split, TP) produce a partial sum here: out-of-range picks are masked inactive inside
         # the mgemm kernel and contribute exact zeros
         elif bszn_eligible and _p2b_moe_env and self._p2b_ok():
-            # p2b slot-table path: shared experts fall through to the common eager tail below
-            # (bc_sh_exp stays False), applied against x like the non-graph paths; the final
-            # block-level reduction handles the per-rank partial sums under TP
-            final_hidden_states = self._p2b_forward_bszn(y, bsz, selected_experts, routing_weights).view(x.shape)
+            # p2b slot-table path. Shared experts run through their own multi-row graph inside
+            # the helper when bound (bc_sh_exp set True below mirrors the dense-graph path and
+            # suppresses the eager tail); the block-level reduction handles the per-rank
+            # partial sums under TP either way
+            final_hidden_states = self._p2b_forward_bszn(y, x, bsz, selected_experts, routing_weights).view(x.shape)
+            if self.bc_sh_exp:
+                bc_sh_exp = True
 
         elif bszn_eligible:
             self.bc.run_bszN(y, selected_experts, routing_weights)
