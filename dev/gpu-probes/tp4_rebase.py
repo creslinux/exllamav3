@@ -3,8 +3,9 @@ branch coin-flip cannot confound either arm. Both backends, 3 measured runs, spr
 import os, time, json
 os.environ["EXL3_NGRAM_STREAM"] = "1"
 TP = os.environ.get("BENCH_TP", "1") == "1"
-# p2b is TP-only: the flag crashes at load under layer-split (known, flag-scoped)
-os.environ["EXL3_P2B_MOE"] = "1" if TP else "0"
+# LS+p2b load crash is FIXED on this branch (b49f8db: device-scoped launch). Default keeps
+# the historical behavior (TP on, LS off); export EXL3_P2B_MOE to override either arm.
+os.environ["EXL3_P2B_MOE"] = os.environ.get("EXL3_P2B_MOE", "1" if TP else "0")
 
 def main():
     import torch

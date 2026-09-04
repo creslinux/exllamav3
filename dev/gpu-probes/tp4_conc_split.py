@@ -4,7 +4,8 @@ import os, time, json
 os.environ["EXL3_NGRAM_STREAM"] = "1"
 import sys
 TP = os.environ.get("BENCH_TP", "1") == "1"
-os.environ["EXL3_P2B_MOE"] = "1" if TP else "0"
+# LS+p2b fixed on this branch (b49f8db); default keeps historical behavior, env overrides either arm
+os.environ["EXL3_P2B_MOE"] = os.environ.get("EXL3_P2B_MOE", "1" if TP else "0")
 
 def main():
     import torch
