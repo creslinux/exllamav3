@@ -125,13 +125,9 @@ void run_cpu_reduce_jobs
             }
         }
 
-        // No more work
-        if (current_job.data_size == 0)
-            return;
-
-        // Skip job: a one-shot collective advanced the device-side stage counters without a
-        // reduce; keep the pump's lockstep counter in sequence so later real jobs derive the
-        // right stage (their slots are indexed by it). No arrival wait, no data touched.
+        // Skip job FIRST: the skip is pushed with data_size 0 (see pg_all_reduce_oneshot),
+        // and the end check below would otherwise read it as the pass's end marker, retire
+        // the pump mid-pass, and deadlock every later CPU-path collective's recv
         if (current_job.wire_dtype == 3)
         {
             atomic_ref<uint32_t> stage_(&((PGContext*) ctx)->cpusum_stage_cpu);
@@ -139,6 +135,10 @@ void run_cpu_reduce_jobs
             stage_.store_release((stage + 1u) & 0x7fffffffu);
             continue;
         }
+
+        // No more work (data_size 0 with wire_dtype 0 is the end marker)
+        if (current_job.data_size == 0)
+            return;
 
         // Next job ready
         perform_cpu_reduce
