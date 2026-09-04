@@ -2,7 +2,9 @@
 Static window 3 (window-independent ms/round), warm + 2 measured, split instrumentation."""
 import os, time, json
 os.environ["EXL3_NGRAM_STREAM"] = "1"
-os.environ["EXL3_P2B_MOE"] = "1"
+import sys
+TP = os.environ.get("BENCH_TP", "1") == "1"
+os.environ["EXL3_P2B_MOE"] = "1" if TP else "0"
 
 def main():
     import torch
@@ -18,10 +20,10 @@ def main():
     for p in draft.load_gen(use_per_device = [22, 22, 22, 22], verbose = False):
         pass
     for p in model.load_gen(device = None, use_per_device = [22, 22, 22, 22],
-                            tensor_p = True, tp_output_device = 0,
+                            tensor_p = TP, tp_output_device = 0,
                             tp_backend = "native", verbose = False):
         pass
-    print("loaded", flush = True)
+    print(f"loaded [{chr(84)+chr(80)+chr(52) if TP else chr(76)+chr(83)}]", flush = True)
 
     tokenizer = Tokenizer.from_config(config)
     generator = Generator(model, cache, tokenizer,
