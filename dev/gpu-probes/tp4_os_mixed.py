@@ -1,6 +1,13 @@
 """Mixed-contribution parity: the decisive arm. Every 4th collective, ranks 0 and 3
 contribute False (the 0-head split). Non-contributors take the CPU path -> needs a
-pump thread on the master. Prediction: contributing ranks diverge (stale slot data)."""
+pump thread on the master. Prediction: contributing ranks diverge (stale slot data).
+
+Caveat for the record: the original divergence landed on rank 3 (a non-contributor)
+at collective 0, with pump timeouts in the log -- the exact micro-path through the
+harness's thread-based pump was never derived, and the fix removes the CPU path from
+the arm entirely, so this harness alone cannot exclude harness-pump contributions.
+The load-bearing evidence for the fix is the full-model validation (clean text in the
+previously-corrupt p2b+one-shot cell), not this arm."""
 import os, time, threading
 import torch
 import torch.multiprocessing as mp
@@ -65,10 +72,14 @@ def run(rank, world):
                 f"({'mixed' if c % mixed_every == 0 else 'all-contrib'}) maxdiff {d:.3e}")
     log(f"rank {rank}: first_bad {first_bad} worst {worst:.3e}")
 
+    # NOTE: end the pump BEFORE the verification prints, not after -- otherwise the pump
+    # thread's 50s no-jobs deadline fires during the CPU-side compares and prints a spurious
+    # "CPU reduce wait timeout" that looks like a failure. Earlier revisions carried this
+    # noise into committed logs.
     backend.oneshot_max = 0
     if rank == 0:
         backend.end_cpu_reduce_jobs()
-        time.sleep(0.5)
+        time.sleep(1.0)
     backend.close()
 
 if __name__ == "__main__":
