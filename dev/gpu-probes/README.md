@@ -25,3 +25,14 @@ the first window); sync every bracket before believing it (issuance is
 not completion); three runs with spread when the effect is under ~10%;
 one variable per process (the calibrator's learned state persists
 across jobs and contaminates in-process sweeps).
+
+Added later: tp4_round_trace_s (static-window pair -- the per-round-cost
+instrument), tp4_conc (8-stream concurrency), tp4_longctx (deep-context
+decode), tp4_prefill2 (cache-busted prefill gate), tp4_parity_mix
+(mixture-level p2b vs bc), tp4_sweep_clean (one-conf-per-process),
+tp4_os_parity (one-shot collective parity vs gloo -- harness v2; known to
+hang at construction, see the one-shot commits), tp4_discrim (stage
+isolation). Protocol rules added since the first commit: read every A/B
+arm's completion before quoting its number; any new collective gets a
+parity test before its first timing; per-round cost is measured at a
+FIXED window; throughput batteries control the reasoning branch.

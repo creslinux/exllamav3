@@ -411,10 +411,12 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        # One-shot path (EXL3_TP_ONESHOT_MAX, default 64 KiB wire payload): single-chunk float
-        # payloads with every rank contributing reduce device-side in one kernel -- spins on
-        # the peers' stage counters, sums the staged slots directly, no job push, no CPU-pump
-        # rendezvous. Removes the host round trip per collective (~96 per decode pass).
+        # One-shot path (EXL3_TP_ONESHOT_MAX, DEFAULT 0 = OFF -- the kernel currently
+        # produces incorrect output past the stage-ring wrap; parity pending): single-chunk
+        # float payloads with every rank contributing reduce device-side in one kernel.
+        # NOTE: also single-chunk-bound as written -- at batch verify (~160 KB payloads)
+        # it cannot engage below a multi-chunk redesign, which is the regime where the
+        # CPU path's staging+AVX cost scales and where the concurrency plateau lives.
         if self.oneshot_max and contribution and self.device >= 0 and \
             tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and \
             tensor.numel() * 2 <= self.oneshot_max and tensor.numel() * 2 % 16 == 0:
