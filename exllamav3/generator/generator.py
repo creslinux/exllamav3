@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -44,7 +45,7 @@ class Generator:
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
-        draft_confidence: float = 0.4,
+        draft_confidence: float = None,
         record_draft_stats: bool = False,
         **kwargs
     ):
@@ -254,6 +255,12 @@ class Generator:
         self.draft_calibrator = None
         self._draft_conf_round = None
         if self.dynamic_draft and self.draft_model is not None:
+            if draft_confidence is None:
+                # EXL3_DRAFT_CONFIDENCE selects the calibrator target; unset restores the
+                # stock 0.4. Clean one-conf-per-process sweep (3 measured runs, layer-split,
+                # temp 0.6/top-k 20/top-p 0.95): 0.4 -> ~71.5 T/s mean, 0.5 -> 66.4, 0.6 -> 75.0,
+                # 0.7 -> 74.0. 0.6 wins both prompts.
+                draft_confidence = float(os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
 
