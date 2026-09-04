@@ -129,6 +129,17 @@ void run_cpu_reduce_jobs
         if (current_job.data_size == 0)
             return;
 
+        // Skip job: a one-shot collective advanced the device-side stage counters without a
+        // reduce; keep the pump's lockstep counter in sequence so later real jobs derive the
+        // right stage (their slots are indexed by it). No arrival wait, no data touched.
+        if (current_job.wire_dtype == 3)
+        {
+            atomic_ref<uint32_t> stage_(&((PGContext*) ctx)->cpusum_stage_cpu);
+            uint32_t stage = stage_.load_acquire();
+            stage_.store_release((stage + 1u) & 0x7fffffffu);
+            continue;
+        }
+
         // Next job ready
         perform_cpu_reduce
         (
@@ -834,5 +845,10 @@ void pg_all_reduce_oneshot
             (ctx_d, device_mask, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    (void) is_master; (void) master_device;
+
+    // Keep the pump in lockstep: it derives each job's stage from cpusum_stage_cpu, so a
+    // one-shot that advanced the device-side counters without a reduce must still consume a
+    // queue slot. Sentinel wire_dtype 3 (the end marker uses data_size 0 instead).
+    if (is_master)
+        push_reduce_job((PGContext*) ctx, 0, 0, 3);
 }

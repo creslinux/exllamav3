@@ -1035,13 +1035,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         H, I = self.hidden_size, self.intermediate_size_padded
 
         if self.p2b_ids is None:
-            cap = 16 * topk
+            cap = MAX_BSZN * topk
             dev = self.device
             self.p2b_ids = torch.empty(cap, dtype = torch.int32, device = dev)
             self.p2b_rw = torch.empty(cap, dtype = torch.half, device = dev)
             self.p2b_rows = {}
-            self.p2b_out = torch.empty((16, H), dtype = torch.float, device = dev)
-            self.p2b_acc = torch.empty((16, H), dtype = torch.float, device = dev)
+            self.p2b_out = torch.empty((MAX_BSZN, H), dtype = torch.float, device = dev)
+            self.p2b_acc = torch.empty((MAX_BSZN, H), dtype = torch.float, device = dev)
             self.p2b_gate = torch.empty((cap, I), dtype = torch.half, device = dev)
             self.p2b_up = torch.empty((cap, I), dtype = torch.half, device = dev)
             self.p2b_down = torch.empty((cap, H), dtype = torch.half, device = dev)
@@ -1081,7 +1081,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # the common tail when the shared BC was not bound.
         if self.bc_sh_exp:
             if self.p2b_sh is None:
-                self.p2b_sh = torch.empty((1, 16, H), dtype = torch.float, device = self.device)
+                self.p2b_sh = torch.empty((1, MAX_BSZN, H), dtype = torch.float, device = self.device)
             self.shared_experts.bc.run_bszN(y.view(1, bsz, H), self.p2b_sh[:, :bsz])
             ext.add_sigmoid_gate_proj(
                 self.p2b_sh[0, :bsz], x.view(-1, H), out, self.shared_gate.inner.weight,
