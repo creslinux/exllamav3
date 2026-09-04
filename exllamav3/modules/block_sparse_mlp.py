@@ -1035,7 +1035,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         H, I = self.hidden_size, self.intermediate_size_padded
 
         if self.p2b_ids is None:
-            cap = 16 * topk
+            # 2x the eligibility ceiling (bsz <= MAX_BSZN), matching the original sizing:
+            # headroom so a future eligibility bump cannot silently overrun the statics
+            cap = 2 * MAX_BSZN * topk
             dev = self.device
             self.p2b_ids = torch.empty(cap, dtype = torch.int32, device = dev)
             self.p2b_rw = torch.empty(cap, dtype = torch.half, device = dev)
@@ -1051,7 +1053,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.p2b_sh = None
             # One-line engagement proof: the first call prints once per process. A path that
             # silently never engaged has fooled this project's benches four times.
-            print(f" -- p2b MoE path engaged: {self.key}", flush = True)
+            # EXL3_P2B_QUIET=1 suppresses for production logs.
+            if os.environ.get("EXL3_P2B_QUIET", "0").lower() not in ("1", "true", "yes"):
+                print(f" -- p2b MoE path engaged: {self.key}", flush = True)
         if bsz not in self.p2b_rows:
             self.p2b_rows[bsz] = torch.arange(bsz, device = self.device) \
                 .repeat_interleave(topk).to(torch.int32)
