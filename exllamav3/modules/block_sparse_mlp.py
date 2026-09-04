@@ -1201,8 +1201,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                # Count how many assignments per expert. torch.bincount on CUDA forces a
+                # device sync per call (output size must be resolved host-side) -- at 48 MoE
+                # layers that serialized the batch verify at every layer (cProfile: 34% of
+                # the 8-stream wall). scatter_add_ into a fixed-size tensor is device-side,
+                # same counting semantics, no sync -- the same construction routing_std_bias
+                # and pg_all_reduce_cpu already use.
+                expert_count = torch.zeros(E + 1, dtype = torch.long, device = flat_expert_local.device)
+                expert_count.scatter_add_(
+                    0, flat_expert_local,
+                    torch.ones_like(flat_expert_local),
+                )
 
                 def run_fused(num_active):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
