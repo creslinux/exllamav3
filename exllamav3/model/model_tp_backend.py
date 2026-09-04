@@ -411,15 +411,20 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        # One-shot path (EXL3_TP_ONESHOT_MAX, DEFAULT 0 = OFF -- the kernel currently
-        # produces incorrect output past the stage-ring wrap; parity pending): single-chunk
-        # float payloads with every rank contributing reduce device-side in one kernel.
-        # NOTE: also single-chunk-bound as written -- at batch verify (~160 KB payloads)
-        # it cannot engage below a multi-chunk redesign, which is the regime where the
-        # CPU path's staging+AVX cost scales and where the concurrency plateau lives.
-        if self.oneshot_max and contribution and self.device >= 0 and \
+        # One-shot path (EXL3_TP_ONESHOT_MAX, DEFAULT 0 = OFF pending the fix's parity run):
+        # single-chunk float payloads reduce device-side in one kernel. ROUTING IS PAYLOAD-
+        # ONLY, never on `contribution`: mixed-contribution collectives (0-head attention
+        # ranks pass False) must not split protocols across ranks -- the one-shot sums every
+        # slot in the mask unconditionally, and a non-contributor that took the CPU path
+        # never stages its slot, so contributors read stale data (reproduced in
+        # dev/gpu-probes/tp4_os_mixed.py). Non-contributors stage their tensor instead: every
+        # contribution=False call site passes a zeros tensor, so staging it adds exactly
+        # nothing and every rank receives the correct in-place sum.
+        if self.oneshot_max and self.device >= 0 and \
             tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and \
             tensor.numel() * 2 <= self.oneshot_max and tensor.numel() * 2 % 16 == 0:
+            if not contribution:
+                tensor.zero_()
             ext.pg_all_reduce_oneshot(
                 self.ptr_g,
                 self.dev_g,
