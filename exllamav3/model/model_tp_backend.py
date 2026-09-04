@@ -203,6 +203,9 @@ class TPBackendNative:
         self.cpu = cpu
         self.cpu_is_pinned = False
 
+        # One-shot all-reduce payload cap (wire bytes); 0 disables
+        self.oneshot_max = int(os.environ.get("EXL3_TP_ONESHOT_MAX", "0"))
+
         # Timing probe: EXL3_TP_STUB_COLLECTIVES=1 turns the data collectives into no-ops so the
         # forward can be timed without communication cost. Output is garbage; never use for
         # inference. The barrier is kept (stream ordering, no data movement).
@@ -408,9 +411,30 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        # One-shot path (EXL3_TP_ONESHOT_MAX, default 64 KiB wire payload): single-chunk float
+        # payloads with every rank contributing reduce device-side in one kernel -- spins on
+        # the peers' stage counters, sums the staged slots directly, no job push, no CPU-pump
+        # rendezvous. Removes the host round trip per collective (~96 per decode pass).
+        if self.oneshot_max and contribution and self.device >= 0 and \
+            tensor.dtype in (torch.float32, torch.float16, torch.bfloat16) and \
+            tensor.numel() * 2 <= self.oneshot_max and tensor.numel() * 2 % 16 == 0:
+            ext.pg_all_reduce_oneshot(
+                self.ptr_g,
+                self.dev_g,
+                self.active_devices,
+                self.device,
+                self.active_devices[0],
+                tensor,
+                True,
+                self.dev_r,
+                SHBUF_SIZE_R,
+                self.master,
+                self.abort_flag
+            )
+            return
         if self.stub_collectives:
             return
-        # CPU-assisted path unconditionally, matching upstream: GPU workers stage into the R
+        # CPU-assisted path, matching upstream: GPU workers stage into the R
         # buffer, the -1 CPU helper reduces over host memory, workers copy the result back.
         # The device-side ring (pg_all_reduce over the B buffer) was re-enabled briefly and
         # measured on 4x RTX 3090 (PCIe Gen3, P2P unlocked): at decode payload sizes (5 KB fp16

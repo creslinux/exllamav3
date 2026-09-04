@@ -127,6 +127,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_gather_small", &pg_gather_small, "pg_gather_small");
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
+    m.def("pg_all_reduce_oneshot", &pg_all_reduce_oneshot, "pg_all_reduce_oneshot");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 

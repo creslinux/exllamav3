@@ -34,6 +34,20 @@ void pg_all_reduce_cpu
     bool is_master,
     at::Tensor& abort_flag
 );
+void pg_all_reduce_oneshot
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> devices,
+    int this_device,
+    int master_device,
+    at::Tensor& tensor,
+    bool contributor,
+    uintptr_t shbuf_dev,
+    size_t shbuf_size,
+    bool is_master,
+    at::Tensor& abort_flag
+);
 
 void run_cpu_reduce_jobs
 (

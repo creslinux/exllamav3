@@ -79,6 +79,8 @@ void perform_cpu_reduce
 
 // Busy loop to process all incoming jobs until the end marker is reached. Called at the start
 // of a forward pass by the CPU reduce process
+
+
 void run_cpu_reduce_jobs
 (
     uintptr_t ctx_ptr,
@@ -520,6 +522,114 @@ void pg_all_reduce_cpu_recv_kernel
         stg_release_sys_u32(ctx->cpusum_stage_recv + this_device * REDUCE_STAGE_STRIDE, cc);
 }
 
+
+// ---------------------------------------------------------------------------
+// One-shot all-reduce for single-chunk payloads: replaces the CPU-pump rendezvous.
+//
+// The send kernel stages this rank's contribution and bumps its stage counter as usual
+// (stream-ordered ahead of this kernel). This kernel then spins directly on the PEER ranks'
+// stage counters (host-mapped, acquire loads), reads every rank's staged wire slot -- self
+// included, so the sum matches the pump's semantics including the self wire rounding --
+// accumulates in fp32 and writes the total to the local tensor. No job is pushed and the
+// CPU helper is never involved: single-chunk send kernels never consult the ring throttle
+// (num_iter = 1 < max_buf_stages), slot reuse is safe by stream order, and the pump's global
+// consume counter keeps its original meaning for any multi-chunk collective in the same pass.
+// The recv-side discovery counter is advanced to keep later multi-chunk recv blocks in step.
+// ---------------------------------------------------------------------------
+
+template <int dtype>
+__device__ __forceinline__ float os_wire_elem(const uint8_t* src8, int idx)
+{
+    if constexpr (dtype == PARCK_MODE_HALF)
+        return __half2float(((const __half*) src8)[idx]);
+    else  // BF16 wire: raw 16-bit words (fp32 payloads pack to bf16, bf16 tensors copy)
+        return __bfloat162float(((const __nv_bfloat16*) src8)[idx]);
+}
+
+template <int dtype>
+__global__ __launch_bounds__(NUM_THREADS)
+void pg_all_reduce_oneshot_kernel
+(
+    PGContext* __restrict__ ctx,
+    uint32_t device_mask,
+    int this_device,
+    uint8_t* __restrict__ data_ptr,
+    uint8_t* __restrict__ shbuf_ptr,
+    size_t data_size,
+    size_t shbuf_size,
+    uint32_t* abort_flag
+)
+{
+    const uint32_t buf_slot_size = (shbuf_size / (MAX_DEVICES + 1) / 1024) * 1024;
+    const uint32_t max_buf_stages = buf_slot_size / CPUREDUCE_CHUNK_SIZE;
+    int t = threadIdx.x;
+
+    // Own send kernel ran on this stream: counter already holds stage + 1
+    __shared__ uint32_t cc;
+    if (t == 0)
+        cc = (uint32_t)ldg_acquire_sys_u32(ctx->cpusum_stage_device + this_device * REDUCE_STAGE_STRIDE)
+             & 0x7fffffffu;
+    __syncthreads();
+    uint32_t stage = (cc - 1u) & 0x7fffffffu;
+
+    // Wait for every peer's stage counter to reach this stage
+    if (t == 0)
+    {
+        uint64_t deadline = sync_deadline();
+        uint64_t sleep = SYNC_MIN_SLEEP;
+        bool done = false;
+        while (!done)
+        {
+            done = true;
+            for (int d = 0; d < MAX_DEVICES; ++d)
+            {
+                if (d == this_device || !(device_mask & (1u << d))) continue;
+                uint32_t p = (uint32_t)ldg_acquire_sys_u32(ctx->cpusum_stage_device + d * REDUCE_STAGE_STRIDE)
+                             & 0x7fffffffu;
+                if ((int)p < (int)cc) { done = false; break; }
+            }
+            if (done) break;
+            __nanosleep(sleep);
+            if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
+            else if (check_timeout(ctx, deadline, "pg_all_reduce_oneshot_kernel"))
+            {
+                *abort_flag = 1;
+                done = true;  // exit the wait; aborted peers will not have staged coherently
+            }
+        }
+    }
+    __syncthreads();
+    if (*abort_flag) return;
+
+    // Element counts: every wire format is 16 bits per wire element. HALF/BF16 tensors copy
+    // element-for-element; FLOAT tensors carry two fp32 elements per wire element pair, i.e.
+    // the wire holds one bf16 per fp32 element (the send kernel's 2:1 pack is by bytes).
+    const int elems = (int)((dtype == PARCK_MODE_FLOAT) ? (data_size / 4) : (data_size / 2));
+
+    // Accumulate every rank's slot (self included) in fp32, lane-strided, and write the total
+    // back in the tensor's own dtype
+    for (int i = t; i < elems; i += NUM_THREADS)
+    {
+        float acc = 0.0f;
+        for (int d = 0; d < MAX_DEVICES; ++d)
+        {
+            if (!(device_mask & (1u << d))) continue;
+            const uint8_t* slot = shbuf_ptr + buf_slot_size * d
+                                  + (stage % max_buf_stages) * CPUREDUCE_CHUNK_SIZE;
+            acc += os_wire_elem<dtype>(slot, i);
+        }
+        if constexpr (dtype == PARCK_MODE_HALF)
+            ((__half*) data_ptr)[i] = __float2half_rn(acc);
+        else if constexpr (dtype == PARCK_MODE_BF16)
+            ((__nv_bfloat16*) data_ptr)[i] = __float2bfloat16_rn(acc);
+        else
+            ((float*) data_ptr)[i] = acc;
+    }
+    __syncthreads();
+    if (t == 0)
+        stg_release_sys_u32(ctx->cpusum_stage_recv + this_device * REDUCE_STAGE_STRIDE, cc);
+}
+
 void pg_all_reduce_cpu
 (
     uintptr_t ctx,
@@ -665,4 +775,64 @@ void pg_all_reduce_cpu
     // Master also queues up CPU reduction. Job will be popped in separate CPU reduce process
     if (is_master)
         push_reduce_job((PGContext*) ctx, cpu_data_size, device_mask, wire_dtype);
+}
+
+void pg_all_reduce_oneshot
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> devices,
+    int this_device,
+    int master_device,
+    at::Tensor& tensor,
+    bool contributor,
+    uintptr_t shbuf_dev,
+    size_t shbuf_size,
+    bool is_master,
+    at::Tensor& abort_flag
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(this_device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    pg_check_timeout(ctx);
+
+    uint32_t device_mask = 0;
+    for (int i : devices) device_mask |= (1 << i);
+
+    uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
+    uint8_t* shbuf_ptr = (uint8_t*) shbuf_dev;
+    size_t cpu_data_size = tensor.numel() * 2;
+    size_t device_data_size = tensor.numel() * tensor.element_size();
+
+    TORCH_CHECK(cpu_data_size <= CPUREDUCE_CHUNK_SIZE, "oneshot all-reduce is single-chunk only");
+    TORCH_CHECK(contributor, "oneshot all-reduce requires contributor on every rank");
+
+    uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
+    PGContext* ctx_d = (PGContext*) ctx_dev;
+
+    // Stage + bump this rank's counter (the existing send kernel), then reduce
+    if (tensor.dtype() == at::kFloat)
+    {
+        pg_all_reduce_cpu_send_kernel<PARCK_MODE_FLOAT><<<1, NUM_THREADS, 0, stream>>>
+            (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, contributor);
+        pg_all_reduce_oneshot_kernel<PARCK_MODE_FLOAT><<<1, NUM_THREADS, 0, stream>>>
+            (ctx_d, device_mask, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
+    }
+    else if (tensor.dtype() == at::kHalf)
+    {
+        // Raw 16-bit words on the wire either way; decode as half
+        pg_all_reduce_cpu_send_kernel<PARCK_MODE_BF16><<<1, NUM_THREADS, 0, stream>>>
+            (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, contributor);
+        pg_all_reduce_oneshot_kernel<PARCK_MODE_HALF><<<1, NUM_THREADS, 0, stream>>>
+            (ctx_d, device_mask, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
+    }
+    else
+    {
+        pg_all_reduce_cpu_send_kernel<PARCK_MODE_BF16><<<1, NUM_THREADS, 0, stream>>>
+            (ctx_d, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, contributor);
+        pg_all_reduce_oneshot_kernel<PARCK_MODE_BF16><<<1, NUM_THREADS, 0, stream>>>
+            (ctx_d, device_mask, this_device, data_ptr, shbuf_ptr, device_data_size, shbuf_size, abort_flag_ptr);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    (void) is_master; (void) master_device;
 }
