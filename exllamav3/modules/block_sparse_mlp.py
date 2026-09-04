@@ -1056,40 +1056,75 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # EXL3_P2B_QUIET=1 suppresses for production logs.
             if os.environ.get("EXL3_P2B_QUIET", "0").lower() not in ("1", "true", "yes"):
                 print(f" -- p2b MoE path engaged: {self.key}", flush = True)
+            self._p2b_dump_seq = 0
         if bsz not in self.p2b_rows:
             self.p2b_rows[bsz] = torch.arange(bsz, device = self.device) \
                 .repeat_interleave(topk).to(torch.int32)
 
         first = self.routing_first if self.routing_first is not None else 0
-        ext.p2b_map_slots(
-            selected_experts.reshape(-1), routing_weights.reshape(-1),
-            self.p2b_ids[:n], self.p2b_rw[:n], first, E,
-        )
-
-        out = self.p2b_out[:bsz]
-        ext.p2b_fused_moe(
-            y, out,
-            mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh,
-            mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh,
-            md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh,
-            self.p2b_ids[:n], self.p2b_rows[bsz], self.p2b_rw[:n],
-            mg.K, mg.K, mg.K, bool(mg.mcg), bool(mg.mul1),
-            H, I,
-            self.p2b_gate[:n], self.p2b_up[:n], self.p2b_down[:n],
-            self.p2b_hg[:n], self.p2b_hu[:n], self.p2b_hd[:n],
-            self.p2b_acc[:bsz],
-        )
-
-        # Shared expert through its own multi-row graph + the sigmoid-gate combine, replacing
-        # the eager tail (~100-150 us/layer) with ~25 us + one combine kernel. Falls back to
-        # the common tail when the shared BC was not bound.
-        if self.bc_sh_exp:
-            if self.p2b_sh is None:
-                self.p2b_sh = torch.empty((1, 16, H), dtype = torch.float, device = self.device)
-            self.shared_experts.bc.run_bszN(y.view(1, bsz, H), self.p2b_sh[:, :bsz])
-            ext.add_sigmoid_gate_proj(
-                self.p2b_sh[0, :bsz], x.view(-1, H), out, self.shared_gate.inner.weight,
+        # Launch on the layer's own device: the LS forward does not set the current CUDA
+        # device around eager ext calls (it stays cuda:0 process-wide), and while a cuda:0
+        # launch can reach cuda:1 tensors through peer access, non-peer pairs (cuda:0 ->
+        # cuda:2+) fault with an illegal access inside the kernel. The standalone harness
+        # never saw this because it calls under an explicit torch.cuda.device(dev) context.
+        with torch.cuda.device(self.device):
+            ext.p2b_map_slots(
+                selected_experts.reshape(-1), routing_weights.reshape(-1),
+                self.p2b_ids[:n], self.p2b_rw[:n], first, E,
             )
+
+            out = self.p2b_out[:bsz]
+
+            # EXL3_P2B_DUMP=<dir>: dump the exact inputs of every p2b call (crash forensics;
+            # left in for future fault triage, no-op in production)
+            dump_dir = os.environ.get("EXL3_P2B_DUMP", "")
+            if dump_dir:
+                os.makedirs(dump_dir, exist_ok = True)
+                torch.save(
+                    {
+                        "key": self.key, "device": str(self.device),
+                        "current_device": torch.cuda.current_device(),
+                        "statics_device": str(self.p2b_ids.device),
+                        "y_device": str(y.device),
+                        "y": y.detach().clone(), "ids": self.p2b_ids[:n].clone(),
+                        "rows": self.p2b_rows[bsz].clone(), "rw": self.p2b_rw[:n].clone(),
+                        "selected": selected_experts.detach().clone(),
+                        "weights": routing_weights.detach().clone(),
+                        "first": first, "E": E, "topk": topk, "bsz": bsz,
+                        "K": mg.K, "mcg": bool(mg.mcg), "mul1": bool(mg.mul1),
+                        "H": H, "I": I,
+                        "ptrs": [t.detach().clone() for t in
+                                 (mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh,
+                                  mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh,
+                                  md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh)],
+                    },
+                    os.path.join(dump_dir, f"{self._p2b_dump_seq:03d}_{self.key.replace('.', '_')}.pt"),
+                )
+                self._p2b_dump_seq += 1
+
+            ext.p2b_fused_moe(
+                y, out,
+                mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh,
+                mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh,
+                md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh,
+                self.p2b_ids[:n], self.p2b_rows[bsz], self.p2b_rw[:n],
+                mg.K, mg.K, mg.K, bool(mg.mcg), bool(mg.mul1),
+                H, I,
+                self.p2b_gate[:n], self.p2b_up[:n], self.p2b_down[:n],
+                self.p2b_hg[:n], self.p2b_hu[:n], self.p2b_hd[:n],
+                self.p2b_acc[:bsz],
+            )
+
+            # Shared expert through its own multi-row graph + the sigmoid-gate combine, replacing
+            # the eager tail (~100-150 us/layer) with ~25 us + one combine kernel. Falls back to
+            # the common tail when the shared BC was not bound.
+            if self.bc_sh_exp:
+                if self.p2b_sh is None:
+                    self.p2b_sh = torch.empty((1, 16, H), dtype = torch.float, device = self.device)
+                self.shared_experts.bc.run_bszN(y.view(1, bsz, H), self.p2b_sh[:, :bsz])
+                ext.add_sigmoid_gate_proj(
+                    self.p2b_sh[0, :bsz], x.view(-1, H), out, self.shared_gate.inner.weight,
+                )
 
         return out
 
