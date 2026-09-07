@@ -589,6 +589,13 @@ class QSAIndexer(Module):
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
         if getattr(layer, "qk", None) is not None:
+            # One-time engagement proof: the quantised sparse path actually ran. A path that
+            # silently never engaged has fooled this project's benches before.
+            if not getattr(self, "_qsa_q8_engaged", False):
+                self._qsa_q8_engaged = True
+                import os as _os
+                if _os.environ.get("EXL3_QSA_QUIET", "0").lower() not in ("1", "true", "yes"):
+                    print(f" -- QSA quantised sparse attention engaged: {attn.key}", flush = True)
             # Quantised K/V (indexer planes stay fp16): pass the packed tensors + group scales
             o = qsa_sparse_attend_rows(
                 q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
