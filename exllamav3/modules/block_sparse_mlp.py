@@ -24,7 +24,11 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 
-TEMP_ROWS_FUSED = 128
+import os
+# Fused-kernel per-expert row cap, driven by EXL3_TEMP_ROWS_FUSED (default 128). At 2048 a
+# 2048-row prefill chunk takes the fused path unconditionally (no count readback, no overflow
+# loop, no DQ path) for +246 MB staging per card. The guard below only needs cap >= chunk rows.
+TEMP_ROWS_FUSED = int(os.environ.get("EXL3_TEMP_ROWS_FUSED", "128"))
 TEMP_ROWS_GRAPH = 32
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
