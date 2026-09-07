@@ -1289,12 +1289,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         num_active
                     )
 
-                # With few enough total assignments, no expert can exceed the fused kernel's
-                # row capacity: the fused path handles everything, the per-expert count
-                # readback (a CPU sync per layer, ~33% idle at MTP verify shapes) is
-                # unnecessary, and the overflow fallback loop below cannot have work.
-                # num_active -1 = unknown, kernel launches at max concurrency
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
+                # The per-expert count readback (a CPU sync per layer, measured ~33% idle at
+                # MTP verify shapes, and a full prefill-batch cost) is needed only when some
+                # expert can exceed the fused kernel's row cap. Each token contributes at most
+                # one row per expert (top-k picks distinct experts), so an expert holds at most
+                # num_tokens rows: TEMP_ROWS_FUSED >= num_tokens is a sufficient condition for
+                # the fused path to handle every expert, and the readback, the overflow fallback
+                # loop and the DQ path all vanish. num_active -1 = unknown, kernel launches at
+                # max concurrency and self-limits on the per-expert counts.
+                if self.fused_mode_buffers is not None and TEMP_ROWS_FUSED >= num_tokens:
                     run_fused(-1)
                     expert_count_list = None
                 else:
