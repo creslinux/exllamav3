@@ -30,6 +30,7 @@ runtime arguments or derived on device, so the kernels are CUDA-graph-safe.
 """
 
 import torch
+from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32, _get_h32
 
 try:
     import triton
@@ -160,6 +161,9 @@ if has_triton:
         num_pages_per_seq,
         num_splits,
         split_len,
+        k_scales,            # fp16 group scales for the quantised cache (QSA-Q8); unused fp16
+        v_scales,
+        h32,                 # 32x32 fp16 Hadamard/sqrt(32), q/output rotation for the quant path
         n_q_heads: tl.constexpr,
         n_kv_heads: tl.constexpr,
         page_size: tl.constexpr,
@@ -169,6 +173,8 @@ if has_triton:
         BLOCK_H: tl.constexpr,
         BLOCK_N: tl.constexpr,
         PAGED: tl.constexpr = 1,
+        QCK: tl.constexpr = 0,   # k/v quantised-cache bits (0 = fp16 path, bit-identical)
+        QCV: tl.constexpr = 0,
     ):
         """Gathered GQA flash-decoding phase 1 over an index list, q_len == 1: one program per
         (batch, kv_head, h_block, split), iterating the row's indices instead of the sequential
@@ -192,6 +198,8 @@ if has_triton:
         offs_d = tl.arange(0, head_dim)
         q_base = (batch * n_q_heads + q_head) * head_dim
         q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask = valid_row[:, None], other = 0.0)
+        if QCK > 0:
+            q_tile = _rot_h32(q_tile, h32, BLOCK_H, head_dim)
 
         n_start = split * split_len
         n_end = tl.minimum(n_start + split_len, k_len)
@@ -212,8 +220,11 @@ if has_triton:
             else:
                 tok = idx_c
 
-            k_ptrs = k_cache + ((tok[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
-            k_tile = tl.load(k_ptrs, mask = valid_n[None, :], other = 0.0)
+            if QCK > 0:
+                k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n, QCK, n_kv_heads, head_dim)
+            else:
+                k_ptrs = k_cache + ((tok[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+                k_tile = tl.load(k_ptrs, mask = valid_n[None, :], other = 0.0)
             scores = tl.dot(q_tile, k_tile) * scale
 
             valid = valid_row[:, None] & valid_n[None, :]
@@ -226,8 +237,11 @@ if has_triton:
             alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
             l = l * alpha + tl.sum(p, axis = 1)
 
-            v_ptrs = v_cache + ((tok[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            v_tile = tl.load(v_ptrs, mask = valid_n[:, None], other = 0.0)
+            if QCV > 0:
+                v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n, QCV, n_kv_heads, head_dim)
+            else:
+                v_ptrs = v_cache + ((tok[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+                v_tile = tl.load(v_ptrs, mask = valid_n[:, None], other = 0.0)
             acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
             m = m_new
 
@@ -256,6 +270,11 @@ if has_triton:
         sm_scale: float,
         block_table: torch.Tensor | None = None,   # (R, num_pages) int32, one row per query row
         page_size: int = 0,
+        k_scales: torch.Tensor | None = None,   # quantised-cache group scales (fp16); None = fp16
+        v_scales: torch.Tensor | None = None,
+        k_bits: int = 0,
+        v_bits: int = 0,
+        n_kv_heads: int | None = None,
     ) -> torch.Tensor:
         """Eager gathered GQA attention, one index list per query row: the sparse prefill /
         eager-fallback form of the BC sparse decode kernels. block_table = None runs the flat
@@ -264,7 +283,7 @@ if has_triton:
         rows (decode fallback) still fill the device. Returns (R, n_q_heads, head_dim) fp16."""
         from .triton_paged import _paged_attn_decode_combine_kernel
         R, H, hd = q.shape
-        kvh = k.shape[1]
+        kvh = n_kv_heads if n_kv_heads is not None else k.shape[1]
         group = H // kvh
         BLOCK_H = 16
         BLOCK_N = 32
@@ -284,20 +303,27 @@ if has_triton:
         partial_ml = torch.empty((programs * splits * BLOCK_H * 2,), dtype = torch.float, device = dev)
         o = torch.empty((R, H, hd), dtype = torch.half, device = dev)
 
+        quant = k_bits > 0 or v_bits > 0
+        h32 = _get_h32(dev) if quant else partial_ml  # dummy when fp16 (unused)
+        k_sc = k_scales if k_scales is not None else partial_ml
+        v_sc = v_scales if v_scales is not None else partial_ml
+
         # Triton JIT launches on the CURRENT device; with a model split across GPUs this
         # layer's device need not be current
         with torch.cuda.device(dev):
             _qsa_sparse_split_kernel[(programs, splits)](
                 q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
                 K_pad, block_table.shape[1] if paged else 0, splits, split_len,
+                k_sc, v_sc, h32,
                 n_q_heads = H, n_kv_heads = kvh, page_size = page_size if paged else 1,
                 head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
                 BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
+                QCK = k_bits, QCV = v_bits,
                 num_warps = 4, num_stages = 2,
             )
             _paged_attn_decode_combine_kernel[(programs,)](
-                partial_o, partial_ml, o, partial_ml, splits, partial_ml,
-                QCV = 0, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
+                partial_o, partial_ml, o, h32, splits, partial_ml,
+                QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
                 head_dim = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
                 num_warps = 4, num_stages = 1,
             )
