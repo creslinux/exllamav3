@@ -588,11 +588,23 @@ class QSAIndexer(Module):
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
-        o = qsa_sparse_attend_rows(
-            q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
-            layer.k.view(-1, attn.num_kv_heads, attn.head_dim),
-            layer.v.view(-1, attn.num_kv_heads, attn.head_dim),
-            indices, attn.sm_scale,
-            block_table = bt_rows, page_size = layer.k.shape[1],
-        )
+        if getattr(layer, "qk", None) is not None:
+            # Quantised K/V (indexer planes stay fp16): pass the packed tensors + group scales
+            o = qsa_sparse_attend_rows(
+                q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
+                layer.qk.view(-1), layer.qv.view(-1),
+                indices, attn.sm_scale,
+                block_table = bt_rows, page_size = layer.qk.shape[1],
+                k_scales = layer.sk.view(-1), v_scales = layer.sv.view(-1),
+                k_bits = layer.k_bits, v_bits = layer.v_bits,
+                n_kv_heads = attn.num_kv_heads,
+            )
+        else:
+            o = qsa_sparse_attend_rows(
+                q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
+                layer.k.view(-1, attn.num_kv_heads, attn.head_dim),
+                layer.v.view(-1, attn.num_kv_heads, attn.head_dim),
+                indices, attn.sm_scale,
+                block_table = bt_rows, page_size = layer.k.shape[1],
+            )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)

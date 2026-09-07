@@ -828,10 +828,19 @@ class Attention(Module):
     def cache_layer_type(self, default, kwargs: dict):
         if self.qsa_indexer is None:
             return default, kwargs
+        import os
         from ..cache.fp16 import CacheLayer_fp16
-        from ..cache.qsa import CacheLayer_qsa
+        from ..cache.quant import CacheLayer_quant
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        if default is CacheLayer_quant:
+            # Quantised K/V (TabbyAPI cache_mode Q4/Q6/Q8), fp16 indexer planes stay fp16
+            return CacheLayer_qsa_quant, kwargs
         assert default is CacheLayer_fp16, \
-            "QSA attention currently supports only the fp16 cache layer"
+            "QSA attention supports only the fp16 or quantised cache layer"
+        bits = os.environ.get("EXL3_QSA_CACHE_BITS", "0").strip()
+        if bits and bits != "0":
+            kb = int(bits)
+            return CacheLayer_qsa_quant, {**kwargs, "k_bits": kb, "v_bits": kb}
         return CacheLayer_qsa, kwargs
 
 
@@ -844,10 +853,10 @@ class Attention(Module):
         if cache is None:
             return
         from ..cache import CacheLayer
-        from ..cache.qsa import CacheLayer_qsa
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
         layer = cache if isinstance(cache, CacheLayer) else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
-        if not isinstance(layer, CacheLayer_qsa):
+        if not isinstance(layer, (CacheLayer_qsa, CacheLayer_qsa_quant)):
             return
         chunk = params["batch_shape"][1]
 
@@ -869,12 +878,17 @@ class Attention(Module):
 
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
-        num_pages = layer.k.shape[0]
+        quant = getattr(layer, "qk", None) is not None
+        num_pages = (layer.qk if quant else layer.k).shape[0]
         t_syn = num_pages * PAGE_SIZE - chunk
         if t_syn + chunk <= self.qsa_indexer.sparse_threshold():
             return   # cache too small to ever reach the sparse regime
-        layer.k[0].zero_()
-        layer.v[0].zero_()
+        if quant:
+            layer.qk[0].zero_(); layer.qv[0].zero_()
+            layer.sk[0].zero_(); layer.sv[0].zero_()
+        else:
+            layer.k[0].zero_()
+            layer.v[0].zero_()
         layer.raw_k[0].zero_()
         layer.pooled[0].zero_()
         p2 = {k2: v2 for k2, v2 in params.items() if k2 not in
