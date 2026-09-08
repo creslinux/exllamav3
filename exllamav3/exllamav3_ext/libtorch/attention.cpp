@@ -139,7 +139,6 @@ void BC_Attention::set_qsa
 )
 {
     TORCH_CHECK(_qk_proj, "BC_Attention: QSA requires a quantized index_qk projection");
-    TORCH_CHECK(!quant_cache, "BC_Attention: QSA requires the fp16 cache");
     qsa = true;
     qsa_qk_proj = std::move(_qk_proj);
     qsa_q_norm_w = std::move(_q_norm_w);
@@ -634,21 +633,47 @@ void BC_Attention::run_gr
         }
         {
             // num_pages_per_seq 0: the kernel's per-row "batch" index then always selects
-            // block-table row 0, shared by all q_len rows of the single job
-            std::vector<void*> args =
+            // block-table row 0, shared by all q_len rows of the single job. The quantised
+            // kernel carries three extra pointers (k/v scales, h32) AFTER split_len; the only
+            // recorded param below (block_table, index 3) is unchanged across both forms.
+            std::vector<void*> args;
+            if (quant_cache)
             {
-                (void*) s.q.data_ptr(),
-                (void*) cache_k.data_ptr(),
-                (void*) cache_v.data_ptr(),
-                (void*) block_table.data_ptr(),
-                (void*) s.qsa_indices.data_ptr(),
-                (void*) s.partial_o.data_ptr(),
-                (void*) s.partial_ml.data_ptr(),
-                (void*) (intptr_t) (int) s.qsa_indices.size(1),
-                (void*) (intptr_t) 0,
-                (void*) (intptr_t) s.qsa_splits,
-                (void*) (intptr_t) s.qsa_split_len,
-            };
+                args =
+                {
+                    (void*) s.q.data_ptr(),
+                    (void*) cache_k.data_ptr(),
+                    (void*) cache_v.data_ptr(),
+                    (void*) block_table.data_ptr(),
+                    (void*) s.qsa_indices.data_ptr(),
+                    (void*) s.partial_o.data_ptr(),
+                    (void*) s.partial_ml.data_ptr(),
+                    (void*) (intptr_t) (int) s.qsa_indices.size(1),
+                    (void*) (intptr_t) 0,
+                    (void*) (intptr_t) s.qsa_splits,
+                    (void*) (intptr_t) s.qsa_split_len,
+                    (void*) cache_k_scales.value().data_ptr(),
+                    (void*) cache_v_scales.value().data_ptr(),
+                    (void*) h32.data_ptr(),
+                };
+            }
+            else
+            {
+                args =
+                {
+                    (void*) s.q.data_ptr(),
+                    (void*) cache_k.data_ptr(),
+                    (void*) cache_v.data_ptr(),
+                    (void*) block_table.data_ptr(),
+                    (void*) s.qsa_indices.data_ptr(),
+                    (void*) s.partial_o.data_ptr(),
+                    (void*) s.partial_ml.data_ptr(),
+                    (void*) (intptr_t) (int) s.qsa_indices.size(1),
+                    (void*) (intptr_t) 0,
+                    (void*) (intptr_t) s.qsa_splits,
+                    (void*) (intptr_t) s.qsa_split_len,
+                };
+            }
             s.k_qsa_split->launch(s.qsa_programs, s.qsa_splits, 1, args, stream);
             if (graph)
             {
