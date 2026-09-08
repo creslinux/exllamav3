@@ -115,51 +115,6 @@ sessions; eight slots suits many small ones.
 
 ---
 
-## 2026-09-04 — Draft-confidence calibration
-
-`984824d`
-
-The speculative decoder's calibrator targets a running product of acceptance probabilities and
-cuts the draft window when it drops below a threshold. The default is 0.4. A sweep under matched
-rules found the curve still climbing at 0.5 on both prose and code — 61.6/54.3 at 0.3, 61.8/61.7
-at 0.4, 63.9/69.2 at 0.5 — and the serve now runs 0.6 through `EXL3_DRAFT_CONFIDENCE`.
-
-Worth up to about +7 tok/s on code for a one-line configuration change, and it applies to both
-backends. An earlier attempt to reason about the right value analytically was wrong, because the
-threshold targets the running product rather than per-position acceptance; the sweep settled it.
-
----
-
-## 2026-09-04 — Two layer-split placement bugs
-
-`b49f8db`, and `479df7d` on `fix/ls-device-context`
-
-Enabling the new MoE kernel under layer split crashed at load with an illegal memory access
-during kernel autotune. The kernel was being launched while the current CUDA device was not the
-device holding that layer's weights. Fixed by wrapping the launch in the layer's device context.
-
-The same class of fault, found separately: the layer-split forward did not keep the current
-device pinned to the module's device across the module loop, which is latent for anything that
-allocates or launches without an explicit device guard.
-
----
-
-## 2026-09-04 — Where the concurrency plateau actually comes from
-
-`4de1277`, with `972d544` and `10f30a2` on the tensor-parallel branch
-
-Aggregate throughput flattens as streams are added, and two plausible culprits were priced and
-eliminated: the samplers, and the host synchronisation in the MoE routing count. Neither is the
-cause. The plateau is expert-read scaling — each additional concurrent sequence activates more
-unique experts per layer, so the weight traffic per step grows with the batch even though the
-arithmetic per sequence does not.
-
-That is a property of the architecture at this size, not an implementation defect, and it is why
-the batch-size table above flattens between four and eight streams rather than continuing to
-climb.
-
----
-
 ## 2026-09-06 — The fused-MoE count readback, and a prefill campaign that mostly said no
 
 `6497d40` (the keeper), `51d9abe`, with the investigation in `876c22e` `64799dc` `7d5d110`
@@ -211,6 +166,51 @@ prefill and the 103-120 tok/s coding decode figures come from.
 
 ---
 
+## 2026-09-04 — Draft-confidence calibration
+
+`984824d`
+
+The speculative decoder's calibrator targets a running product of acceptance probabilities and
+cuts the draft window when it drops below a threshold. The default is 0.4. A sweep under matched
+rules found the curve still climbing at 0.5 on both prose and code — 61.6/54.3 at 0.3, 61.8/61.7
+at 0.4, 63.9/69.2 at 0.5 — and the serve now runs 0.6 through `EXL3_DRAFT_CONFIDENCE`.
+
+Worth up to about +7 tok/s on code for a one-line configuration change, and it applies to both
+backends. An earlier attempt to reason about the right value analytically was wrong, because the
+threshold targets the running product rather than per-position acceptance; the sweep settled it.
+
+---
+
+## 2026-09-04 — Two layer-split placement bugs
+
+`b49f8db`, and `479df7d` on `fix/ls-device-context`
+
+Enabling the new MoE kernel under layer split crashed at load with an illegal memory access
+during kernel autotune. The kernel was being launched while the current CUDA device was not the
+device holding that layer's weights. Fixed by wrapping the launch in the layer's device context.
+
+The same class of fault, found separately: the layer-split forward did not keep the current
+device pinned to the module's device across the module loop, which is latent for anything that
+allocates or launches without an explicit device guard.
+
+---
+
+## 2026-09-04 — Where the concurrency plateau actually comes from
+
+`4de1277`, with `972d544` and `10f30a2` on the tensor-parallel branch
+
+Aggregate throughput flattens as streams are added, and two plausible culprits were priced and
+eliminated: the samplers, and the host synchronisation in the MoE routing count. Neither is the
+cause. The plateau is expert-read scaling — each additional concurrent sequence activates more
+unique experts per layer, so the weight traffic per step grows with the batch even though the
+arithmetic per sequence does not.
+
+That is a property of the architecture at this size, not an implementation defect, and it is why
+the batch-size table above flattens between four and eight streams rather than continuing to
+climb.
+
+---
+
 ## 2026-09-03 — p2b cooperative fused-MoE kernel
 
 `28361cb` `bad10c9` `5be809e` `1d17fda`
@@ -231,6 +231,28 @@ two lines of codebook dispatch: a truthiness test on a value that was never zero
 launch decoded with the wrong table. The tell had been in the log the whole time — two
 supposedly different codebooks producing a bit-identical error to five digits. **Two identical
 results from different inputs is a bug, not a confirmation.**
+
+---
+
+## 2026-09-03 — Diagnostic instrumentation, kept in-tree
+
+`bdcb492` `2e193d4` `3c6bff0` `b2beac8` `0a8d3a2`
+
+Most of the findings in this changelog came from purpose-built probes rather than a general
+profiler, and they are committed so the next question does not start from nothing:
+
+- `EXL3_TP_STUB_COLLECTIVES` replaces the collectives with stubs, giving an upper bound on
+  compute by running the forward on garbage. It priced the collectives at 3.7 ms of a 21.4 ms
+  step.
+- `EXL3_TP_TRACE_STEP` brackets each module in the worker loop with both CUDA events and host
+  timers, split by layer class. Comparing the two columns is what proved the decode step is
+  GPU-paced rather than dispatch-bound, and retired a whole line of host-side work.
+- The GPU probe rigs live under `dev/gpu-probes`: the batteries, the concurrency sweeps, the
+  context ladders, and every gate used for the quantised cache.
+
+The general profiler, by contrast, produced the reading that sent five changes into the bin. It
+attributed time spent waiting on the GPU to host work, because the host dispatches during sync
+waits.
 
 ---
 
@@ -261,28 +283,6 @@ targets.
 A one-shot all-reduce variant produced the fastest number the project ever printed, 114.7
 tok/s. Its output was `Write a\nWrite a\n<|im_start|>`. **Read the completion before quoting the
 number.**
-
----
-
-## 2026-09-03 — Diagnostic instrumentation, kept in-tree
-
-`bdcb492` `2e193d4` `3c6bff0` `b2beac8` `0a8d3a2`
-
-Most of the findings in this changelog came from purpose-built probes rather than a general
-profiler, and they are committed so the next question does not start from nothing:
-
-- `EXL3_TP_STUB_COLLECTIVES` replaces the collectives with stubs, giving an upper bound on
-  compute by running the forward on garbage. It priced the collectives at 3.7 ms of a 21.4 ms
-  step.
-- `EXL3_TP_TRACE_STEP` brackets each module in the worker loop with both CUDA events and host
-  timers, split by layer class. Comparing the two columns is what proved the decode step is
-  GPU-paced rather than dispatch-bound, and retired a whole line of host-side work.
-- The GPU probe rigs live under `dev/gpu-probes`: the batteries, the concurrency sweeps, the
-  context ladders, and every gate used for the quantised cache.
-
-The general profiler, by contrast, produced the reading that sent five changes into the bin. It
-attributed time spent waiting on the GPU to host work, because the host dispatches during sync
-waits.
 
 ---
 
