@@ -1,0 +1,58 @@
+# TabbyAPI serving Qwen3.8-Flash-Next EXL3 4.05bpw on 4x RTX 3090, layer split.
+# The example the CHANGELOG describes: perf/ls-opt with the p2b MoE kernel, the allocator
+# hoists, the fused-count guard and the Q6 QSA cache.
+#
+# Two of the environment flags below are the difference between one and three concurrent
+# 260k-token sessions. Neither is set by default, and neither is obvious.
+services:
+  tabby:
+    image: tabby:cu13-dev
+    container_name: tabby
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    environment:
+      # Without expandable segments the caching allocator fragments during the autosplit
+      # load and reports out of memory well before the cards are actually full.
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+      # THE POOL LEVER. Default 1 means prefill dequantises into a shared fp16 scratch
+      # sized for the WHOLE cache, and the autosplit measuring pass triggers it, so the
+      # space is reserved at load. That reservation is identical at fp16, Q8 and Q6 --
+      # quantising the cache alone therefore buys no extra context at all. 0 moves the
+      # dequant into the kernels and cost us nothing measurable at long context.
+      - EXL3_QC_STAGING=0
+
+      # p2b cooperative slot-table MoE kernel: decode round 50.3 -> 34.6 ms.
+      - EXL3_P2B_MOE=1
+      - EXL3_P2B_QUIET=1
+
+      # Draft-window calibration. Upstream default is 0.4; the sweep was still climbing
+      # at 0.5 on both prose and code. Worth up to ~+7 tok/s on code.
+      - EXL3_DRAFT_CONFIDENCE=0.6
+
+      # Per-expert row cap for the fused MoE kernel. Raising it lets prefill chunks take
+      # the fused path with no count readback; costs ~262 MiB/card of staging at 2048.
+      - EXL3_TEMP_ROWS_FUSED=2048
+    volumes:
+      - /mnt/hf-new:/models
+      # The fork's Python package and rebuilt extension, bind-mounted over the installed
+      # wheel. Rebuild the .so in a throwaway container: the serving image has no nvcc and
+      # its cgroup is saturated by the resident model.
+      - ./docker/lsopt/exllamav3:/opt/venv/lib/python3.12/site-packages/exllamav3:ro
+      - ./docker/lsopt/exllamav3_ext.cpython-312-x86_64-linux-gnu.so:/opt/venv/lib/python3.12/site-packages/exllamav3_ext.cpython-312-x86_64-linux-gnu.so:ro
+      - ./docker/tabbyfix/chat_completion.py:/app/endpoints/OAI/utils/chat_completion.py:ro
+      - ./docker/warmup.json:/app/warmup.json:ro
+      - ./config.yml:/app/config.yml
+      - ./api_tokens.yml:/app/api_tokens.yml
+    ports:
+      - "5000:5000"
+    # Wait for the API (which means the model has loaded), then run one long prefill to
+    # burn the first-shape autotune. ~60 s once per boot, so no user ever pays it.
+    entrypoint: ["sh", "-c"]
+    command: >
+      "python main.py --host 0.0.0.0 &
+      for i in $$(seq 1 300); do curl -s -o /dev/null http://localhost:5000/v1/models && break; sleep 2; done;
+      echo ' -- warmup: burning autotune with one long prefill';
+      if curl -s -f -o /dev/null -X POST http://localhost:5000/v1/completions -H \"Authorization: Bearer $${TABBY_ADMIN_KEY}\" -H 'Content-Type: application/json' -d @/app/warmup.json; then echo ' -- warmup OK'; else echo ' -- WARMUP FAILED'; fi;
+      wait"

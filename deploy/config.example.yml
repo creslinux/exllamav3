@@ -1,0 +1,70 @@
+# TabbyAPI config for Qwen3.8-Flash-Next EXL3 4.05bpw, 4x RTX 3090, layer split.
+# This is the shape that serves three concurrent 260k-token sessions.
+network:
+  host: 0.0.0.0
+  port: 5000
+
+model:
+  model_dir: /models
+  model_name: exl3-4.05bpw
+
+  # Per-device load budgets. These are not a hard cap on usage; the loader allocates for
+  # real and advances to the next device on OOM, so an over-tight split fails cleanly at
+  # load rather than at runtime. Raise in ~1 GB steps if a larger pool is refused.
+  gpu_split: [17, 22.5, 22.5, 22.5]
+  gpu_split_auto: false
+
+  # 39 GB n-gram table resident in host RAM. Worth a large prefill delta over disk mode,
+  # and it is most of why the container idles around 41 GB.
+  ngram_ram: true
+  vision_offload: true
+
+  max_seq_len: 262144
+
+  # Total context resident across all RUNNING requests, not per request. Three full-length
+  # sessions need 3 x 262144. A request reserves prompt + max_tokens up front; if the pool
+  # cannot hold it the request queues rather than failing.
+  cache_size: 786432
+
+  # Q4/Q6/Q8 quantise the attention K/V; the QSA indexer's raw and pooled key planes stay
+  # fp16 by design, so block selection is unaffected. Q6 measured within benchmark noise of
+  # fp16 on tool-calling quality.
+  cache_mode: Q6
+
+  output_chunking: false
+
+  # Requests generating simultaneously. Each slot costs ~0.72 GB of GDN recurrent state
+  # spread across the cards, allocated at load whether used or not. Three suits full-context
+  # sessions; eight suits many small ones and is what took 8-stream aggregate to 144.5 tok/s.
+  max_batch_size: 3
+
+  reasoning_budget_tokens: 20000
+  reasoning: true
+  reasoning_start_token: "<think>"
+  reasoning_end_token: "</think>"
+  start_in_reasoning: auto
+  tool_format: qwen3_coder
+  vision: true
+  template_vars_default:
+    reasoning_effort: medium
+
+sampling:
+  # Applies temperature 0.6 / top_p 0.95 only when the client sends nothing (force: false),
+  # so an explicit client temperature wins. Decode measured flat across 0.0, 0.6 and 1.0.
+  override_preset: qwen_reasoning
+
+draft_model:
+  draft_mode: mtp
+  draft_cache_mode: Q8
+  draft_num_tokens: 6
+  dynamic_draft: true
+
+memory:
+  # Pinned host RAM tier: cold KV pages spill here and return on demand, so a returning
+  # session resumes in about a second instead of re-prefilling at ~1,500 tok/s. Byte-correct
+  # under layer split. Sized in MiB.
+  #
+  # SIZE THIS AGAINST HOST RAM, NOT VRAM. At 16384 on a 91 GB host the kernel OOM killer
+  # stopped the server when two concurrent 260k jobs grew the process. 10240 parks roughly
+  # two and a half full contexts at Q6 and leaves headroom.
+  sysmem_kv_cache: 10240
