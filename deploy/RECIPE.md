@@ -97,32 +97,68 @@ each of those is and what it measured.
 
 ### Building the extension
 
-The Python side is a bind mount, but the compiled extension has to be rebuilt.
+**This is the step that delivers the kernel.** The Python files are a bind
+mount, but the mixture-of-experts kernel, the quantised-cache attention path
+and the graph-capture bindings are CUDA and C++ that must be compiled from this
+branch. Without this step you get the stock engine with none of it.
+
+```bash
+git clone -b perf/ls-opt https://github.com/creslinux/exllamav3.git
+cd exllamav3
+export TORCH_CUDA_ARCH_LIST="8.6"        # 3090s
+export MAX_JOBS=8                        # nvcc is memory-hungry; tune to your RAM
+python setup.py build_ext --inplace
+```
+
+`setup.py` walks the whole extension tree and compiles every `.c`, `.cpp` and
+`.cu` it finds, so the new kernels are picked up with no build-file edits. It
+produces `exllamav3_ext.cpython-312-x86_64-linux-gnu.so`, which is what the
+compose file bind-mounts over the wheel's own extension.
+
+Confirm the kernel actually made it in before deploying:
+
+```bash
+strings exllamav3_ext.cpython-312-*.so | grep -c p2b_fused_moe   # must be > 0
+```
+
 Two things will bite you:
 
 1. **The serving image has no `nvcc`.** It runs prebuilt wheels. A working
-   toolchain can be assembled from pip, and every piece must be the same
-   version as torch's CUDA build:
+   toolchain can be assembled from pip, and every piece must match torch's CUDA
+   build:
 
    ```
    pip install nvidia-cuda-nvcc==13.2.86 nvidia-nvvm==13.2.86 \
                nvidia-cuda-cccl==13.2.86 nvidia-cuda-runtime==13.2.86 \
                nvidia-cuda-crt==13.2.86
    ln -sf .../nvidia/cu13/lib/libcudart.so.13 .../nvidia/cu13/lib/libcudart.so
-   export CUDA_HOME=.../nvidia/cu13
+   export CUDA_HOME=.../nvidia/cu13 && export PATH=$CUDA_HOME/bin:$PATH
    ```
 
    Verify the binaries rather than the pip metadata: `nvcc --version`,
-   `ptxas --version`, and the `CUDART_VERSION` in `cuda_runtime_api.h` must all
-   agree.
+   `ptxas --version` and the `CUDART_VERSION` in `cuda_runtime_api.h` must all
+   agree. Pip metadata has lied about this.
 
 2. **Build in a throwaway container, not the serving one.** With the model
-   resident, the serving container's cgroup has no headroom and the compile is
-   OOM-killed.
+   resident the serving container's cgroup has no headroom and the compile is
+   OOM-killed. Mount the checkout into a fresh container off the same image.
 
-Target `-arch=sm_86` for 3090s. Copied source files also need a clean rebuild:
-`docker cp` does not preserve timestamps, so incremental builds silently skip
-changed translation units.
+If you copy sources into a container rather than mounting them, force a clean
+rebuild: `docker cp` does not preserve timestamps, so incremental builds
+silently skip changed translation units. That has produced two "the change did
+nothing" results here that were really "the change was never compiled".
+
+### What you get, and how to prove it is live
+
+| feature | where it lives | proof it is active |
+|---|---|---|
+| p2b mixture-of-experts kernel | compiled `.so` | `EXL3_P2B_MOE=1` set, and `p2b_fused_moe` in the `.so` |
+| quantised QSA KV cache | Python + `.so` | `cache_mode: Q6` loads without the fp16-only assertion |
+| captured decode for the quant cache | `.so` | no eager fallback warning at load |
+| fused-count guard, allocator hoists | Python | in the bind-mounted package |
+
+The engine prints once on the first call of the quantised sparse path. If you
+never see that line at long context, the path is not engaging.
 
 ---
 
