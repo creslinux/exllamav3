@@ -15,7 +15,7 @@
 #include "../ptx.cuh"
 
 template<int t_bits, int MOE_TILESIZE_N, int cb>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16, 2)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 {
     const int group_idx = blockIdx.z;

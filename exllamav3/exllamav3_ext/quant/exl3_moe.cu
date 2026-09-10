@@ -14,7 +14,7 @@ namespace cg = cooperative_groups;
 int exl3_moe_max_concurrency(int device)
 {
     int num_sms = DevCtx::instance().get_num_sms(device);
-    return num_sms / MOE_SMS_PER_EXPERT;
+    return 2 * num_sms / MOE_SMS_PER_EXPERT;   // occupancy experiment: two blocks per SM
 }
 
 std::set<void*> moe_kernel_attr_set[MAX_DEVICES] = {};
@@ -211,13 +211,14 @@ void exl3_moe
     // With a known number of active experts, launch only as many groups as there are experts and widen them to
     // use the freed SMs, up to MOE_MAX_SMS_PER_EXPERT
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= num_sms, "Concurrency too high for device num_sms");
+    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= 2 * num_sms, "Concurrency too high for device num_sms");
     int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
     int group_size = MOE_SMS_PER_EXPERT;
     if (num_active > 0)
     {
         num_groups = MIN(num_groups, num_active);
-        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
+        // occupancy experiment: keep the 8-SM group width and let groups over-subscribe the SMs
+        // (2 blocks/SM) instead of widening single-expert groups
     }
     dim3 grid_dim(group_size, 1, num_groups);
 
@@ -227,7 +228,7 @@ void exl3_moe
 
     if (moe_kernel_attr_set[device].find((void*) kernel) == moe_kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, MOE_SMEM_LAUNCH);
         moe_kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -293,7 +294,7 @@ void exl3_moe
         grid_dim,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        MOE_SMEM_LAUNCH,
         stream
     );
 

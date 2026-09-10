@@ -14,6 +14,10 @@
 #define MOE_SH_STAGES 3
 #define MOE_FRAG_STAGES 3
 
+// Occupancy experiment: dynamic smem actually requested per block. The kernels only lay out
+// ~28-47 KB for the used M=32 shapes; requesting the 90 KB SMEM_MAX caps residency at one block/SM.
+#define MOE_SMEM_LAUNCH (48 * 1024)
+
 #ifndef EXL3_GEMM_BASE_THREADS
 #define EXL3_GEMM_BASE_THREADS 256
 #endif
