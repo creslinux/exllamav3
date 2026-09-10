@@ -216,15 +216,29 @@ climb.
 `28361cb` `bad10c9` `5be809e` `1d17fda`
 (originally `fb5cb0c` `fe09cfb` `74ee7a0` `a7a2068` `2be602e` on the tensor-parallel branch)
 
-A slot-table cooperative mixture-of-experts kernel, ported from an MIT-licensed vLLM plugin
-that had measured it against exllamav3's own path. It takes an explicit list of row-expert
+A slot-table cooperative mixture-of-experts kernel. **The kernel is not ours.** It was written
+by vcruz305 for the [vllm-exl3](https://github.com/vcruz305/vllm-exl3) plugin, MIT licensed, and
+already measured there against exllamav3's own path. What is ours is the port, the integration
+and the debugging. It takes an explicit list of row-expert
 slots rather than the dense form, which lets zero-weight slots be skipped, and it replaced the
 stock MoE decode path behind `EXL3_P2B_MOE`.
 
-**The decode round went from 50.3 ms to 34.6 ms, a 31% cut**, in two stages: the kernel with
-zero-weight slot skipping took it to 45.1, and four follow-ons took it to 34.6 — staged scratch
-buffers replacing seven allocations per layer per pass, the fp32 accumulator returned directly,
-the slot map built in one kernel, and the shared expert through its own captured graph.
+**Measured on the layer-split production line, natural-length generation, four runs per arm:**
+
+| | p2b off | p2b on | gain |
+|---|---:|---:|---:|
+| code | 84.5 tok/s | 104.2 | **+23%** |
+| prose | 71.1 tok/s | 83.6 | **+18%** |
+
+Within-arm spread is under 1.5% on both, so the gap is far outside noise.
+
+An earlier figure of 50.3 to 34.6 ms per round, a 31% cut, is often quoted for this change.
+**That was measured under tensor parallelism, not layer split**, and it should not be read as a
+layer-split result: its headline mechanism, skipping zero-weight slots, has nothing to skip when
+every expert is local. What carries the layer-split gain above is the second commit's four
+follow-ons — staged scratch buffers replacing seven allocations per layer per pass, the fp32
+accumulator returned directly, the slot map built in one kernel, and the shared expert through
+its own captured graph.
 
 Parity failed for a week and the tile was read seven times. It was never wrong. The fault was
 two lines of codebook dispatch: a truthiness test on a value that was never zero, so every
