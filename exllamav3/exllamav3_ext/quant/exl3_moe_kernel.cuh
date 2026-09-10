@@ -18,7 +18,7 @@
 // ones amortise B decode over M=64. All tiers use the MoE-only _mt inner; the shared dense inner
 // is untouched. FS is the fragment pipeline depth per tier.
 template<int t_bits, int M_TILE, int N_TILE, int cb, int FS>
-__device__ __noinline__
+__device__ __forceinline__
 void moe_gemm_tile
 (
     const half* __restrict__ in_addr,
@@ -50,6 +50,33 @@ void moe_gemm_tile
     }
     #undef MOE_TILE_ARGS
     #undef MOE_TILE_SHAPE
+}
+
+// Whole-expert loop for the M=32/64 tiers, outlined so their (larger) register frames do not
+// inflate the kernel's live set. The M=16 tier is left inline at the call site: it is small and
+// every small expert pays a call otherwise.
+template<int t_bits, int M_TILE, int N_TILE, int cb, int FS>
+__device__ __noinline__
+void moe_gemm_rows
+(
+    const half* __restrict__ in_addr,
+    const uint16_t* __restrict__ trellis,
+    half* __restrict__ out_addr,
+    int size_m,
+    const int size_k,
+    const int size_n,
+    int* __restrict__ locks,
+    const int K
+)
+{
+    while (size_m > 0)
+    {
+        moe_gemm_tile<t_bits, M_TILE, N_TILE, cb, FS>
+        (in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K);
+        in_addr += M_TILE * size_k;
+        out_addr += M_TILE * size_n;
+        size_m -= M_TILE;
+    }
 }
 
 template<int t_bits, int MOE_TILESIZE_N, int cb>
@@ -161,30 +188,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
             if (token_count <= 16)
-            {
                 moe_gemm_tile<t_bits, 16, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
                 (in_addr, trellis, out_addr, token_count, hidden_dim, intermediate_dim, locks, K);
-            }
             else if (token_count <= 48)
-            {
-                const half* ia = in_addr; half* oa = out_addr; int size_m = token_count;
-                while (size_m > 0)
-                {
-                    moe_gemm_tile<t_bits, 32, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
-                    (ia, trellis, oa, size_m, hidden_dim, intermediate_dim, locks, K);
-                    ia += 32 * hidden_dim; oa += 32 * intermediate_dim; size_m -= 32;
-                }
-            }
+                moe_gemm_rows<t_bits, 32, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
+                (in_addr, trellis, out_addr, token_count, hidden_dim, intermediate_dim, locks, K);
             else
-            {
-                const half* ia = in_addr; half* oa = out_addr; int size_m = token_count;
-                while (size_m > 0)
-                {
-                    moe_gemm_tile<t_bits, MOE_BIG_M, MOE_TILESIZE_N, cb, MOE_BIG_FS>
-                    (ia, trellis, oa, size_m, hidden_dim, intermediate_dim, locks, K);
-                    ia += MOE_BIG_M * hidden_dim; oa += MOE_BIG_M * intermediate_dim; size_m -= MOE_BIG_M;
-                }
-            }
+                moe_gemm_rows<t_bits, MOE_BIG_M, MOE_TILESIZE_N, cb, MOE_BIG_FS>
+                (in_addr, trellis, out_addr, token_count, hidden_dim, intermediate_dim, locks, K);
         };
 
         if (gated)
@@ -222,30 +233,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
         {
             if (token_count <= 16)
-            {
                 moe_gemm_tile<t_bits, 16, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
                 (in_addr, trellis, out_addr, token_count, intermediate_dim, hidden_dim, locks, K);
-            }
             else if (token_count <= 48)
-            {
-                const half* ia = in_addr; half* oa = out_addr; int size_m = token_count;
-                while (size_m > 0)
-                {
-                    moe_gemm_tile<t_bits, 32, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
-                    (ia, trellis, oa, size_m, intermediate_dim, hidden_dim, locks, K);
-                    ia += 32 * intermediate_dim; oa += 32 * hidden_dim; size_m -= 32;
-                }
-            }
+                moe_gemm_rows<t_bits, 32, MOE_TILESIZE_N, cb, MOE_FRAG_STAGES>
+                (in_addr, trellis, out_addr, token_count, intermediate_dim, hidden_dim, locks, K);
             else
-            {
-                const half* ia = in_addr; half* oa = out_addr; int size_m = token_count;
-                while (size_m > 0)
-                {
-                    moe_gemm_tile<t_bits, MOE_BIG_M, MOE_TILESIZE_N, cb, MOE_BIG_FS>
-                    (ia, trellis, oa, size_m, intermediate_dim, hidden_dim, locks, K);
-                    ia += MOE_BIG_M * intermediate_dim; oa += MOE_BIG_M * hidden_dim; size_m -= MOE_BIG_M;
-                }
-            }
+                moe_gemm_rows<t_bits, MOE_BIG_M, MOE_TILESIZE_N, cb, MOE_BIG_FS>
+                (in_addr, trellis, out_addr, token_count, intermediate_dim, hidden_dim, locks, K);
         };
 
         gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
