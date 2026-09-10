@@ -140,17 +140,17 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     MOE_SH_STAGES,      \
                     MOE_FRAG_STAGES
                 if constexpr (t_bits)
-                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false, true>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
@@ -214,17 +214,17 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     MOE_SH_STAGES,      \
                     MOE_FRAG_STAGES
                 if constexpr (t_bits)
-                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    exl3_gemm_kernel_inner_mt<t_bits, false, cb, SHAPE_ARGS, false, true>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 1: exl3_gemm_kernel_inner_mt<1, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner_mt<2, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner_mt<3, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner_mt<4, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner_mt<5, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner_mt<6, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner_mt<7, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner_mt<8, false, cb, SHAPE_ARGS, false, true>(ARGS); break;
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS

@@ -741,7 +741,7 @@ void exl3_gemm_kernel_inner
 // Multi-row-M prefill variant used only by the fused MoE kernel. Kept separate from the
 // function above so the dense/decode instantiations (TILESIZE_M == 16) are untouched and
 // remain byte-identical. TILEBLOCKS_M row fragments share each dequantized B fragment.
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool N_SPLIT = false>
 inline __device__
 void exl3_gemm_kernel_inner_mt
 (
@@ -816,8 +816,21 @@ void exl3_gemm_kernel_inner_mt
 
     // Start and end index of current slice, must span at least one tile
     int num_slices = gridDim.x;
-    int slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
-    int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    int slice_beg, slice_end;
+    if constexpr (N_SPLIT)
+    {
+        // N-split: each block owns a contiguous range of N tiles and reduces the whole K locally.
+        // No two blocks share an N, so there is no K partial to exchange through global memory.
+        int n_beg = (int) ((long long) tiles_n * blockIdx.x / num_slices);
+        int n_end = (int) ((long long) tiles_n * (blockIdx.x + 1) / num_slices);
+        slice_beg = n_beg * tiles_k;
+        slice_end = n_end * tiles_k;
+    }
+    else
+    {
+        slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
+        slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    }
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 
@@ -1545,6 +1558,28 @@ void exl3_gemm_kernel_inner_mt
 
         // First reduce all partial sums along k for the current slice
         threadblock_reduce();
+
+        if constexpr (N_SPLIT)
+        {
+            // N-split: this block owns every k tile of its N column, so the threadblock reduction
+            // above is already the complete sum. Write the slice once and move on, no global partial,
+            // no cross-block barrier.
+            if (!sub_k)
+            {
+                if constexpr (shmem_out_had)
+                    write_sum_tile_sh();
+                else
+                    write_sum_gl();
+            }
+            if constexpr (shmem_out_had)
+            {
+                __syncthreads();
+                if (!sub_k)
+                    output_had_sh_gl();
+            }
+            clear_frag_c();
+            return;
+        }
 
         // Process (partial) slices within column in reverse order so the threadblock doing the bottom slice is
         // free to proceed to the next column right away
