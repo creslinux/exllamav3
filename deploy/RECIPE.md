@@ -90,42 +90,46 @@ pip install --no-deps \
 
 `--no-deps` matters. Let it resolve dependencies and it will replace your torch.
 
-**This fork's package**, branch `perf/ls-opt`, bind-mounted over the installed
-one. That branch carries the mixture-of-experts kernel, the allocator hoists,
-the fused-count guard and the quantised QSA cache. See `CHANGELOG.md` for what
-each of those is and what it measured.
-
-### Building the extension
-
-**This is the step that delivers the kernel.** The Python files are a bind
-mount, but the mixture-of-experts kernel, the quantised-cache attention path
-and the graph-capture bindings are CUDA and C++ that must be compiled from this
-branch. Without this step you get the stock engine with none of it.
+**This fork's engine**, branch `perf/ls-opt`. One command installs it:
 
 ```bash
 git clone -b perf/ls-opt https://github.com/creslinux/exllamav3.git
 cd exllamav3
 export TORCH_CUDA_ARCH_LIST="8.6"        # 3090s
 export MAX_JOBS=8                        # nvcc is memory-hungry; tune to your RAM
-python setup.py build_ext --inplace
+pip install --no-build-isolation .
 ```
+
+That compiles the CUDA extension and installs the Python package together,
+replacing the 1.4.6 wheel. `--no-build-isolation` matters: without it pip builds
+against a fresh environment and can pull a different torch.
+
+**Both halves are required and must match.** The mixture-of-experts kernel, the
+quantised-cache attention path and the capture bindings are compiled code; the
+Python side is what gates and feeds them. Stock Python with this extension does
+nothing; this Python with the stock extension fails on missing symbols.
+Installing them together is why the single command is the safe route.
 
 `setup.py` walks the whole extension tree and compiles every `.c`, `.cpp` and
-`.cu` it finds, so the new kernels are picked up with no build-file edits. It
-produces `exllamav3_ext.cpython-312-x86_64-linux-gnu.so`, which is what the
-compose file bind-mounts over the wheel's own extension.
-
-Confirm the kernel actually made it in before deploying:
+`.cu` it finds, so the new kernels need no build-file changes. Confirm one
+arrived:
 
 ```bash
-strings exllamav3_ext.cpython-312-*.so | grep -c p2b_fused_moe   # must be > 0
+python -c "import exllamav3_ext as e; print(hasattr(e, 'p2b_fused_moe'))"   # True
 ```
 
-Two things will bite you:
+See `CHANGELOG.md` for what each change is and what it measured.
 
-1. **The serving image has no `nvcc`.** It runs prebuilt wheels. A working
+### Requirements for the build
+
+An `nvcc` whose CUDA version matches torch's build, and enough RAM to compile.
+That is the whole list, on a normal development machine.
+
+Inside a container it is less pleasant, and two things will bite:
+
+1. **A serving image typically has no `nvcc`** — it runs prebuilt wheels. A
    toolchain can be assembled from pip, and every piece must match torch's CUDA
-   build:
+   version:
 
    ```
    pip install nvidia-cuda-nvcc==13.2.86 nvidia-nvvm==13.2.86 \
@@ -140,22 +144,34 @@ Two things will bite you:
    agree. Pip metadata has lied about this.
 
 2. **Build in a throwaway container, not the serving one.** With the model
-   resident the serving container's cgroup has no headroom and the compile is
-   OOM-killed. Mount the checkout into a fresh container off the same image.
+   resident, the serving container's cgroup has no headroom and the compile is
+   OOM-killed.
 
-If you copy sources into a container rather than mounting them, force a clean
-rebuild: `docker cp` does not preserve timestamps, so incremental builds
-silently skip changed translation units. That has produced two "the change did
-nothing" results here that were really "the change was never compiled".
+### If you plan to modify the engine
+
+The reference machine does not install the package. It builds the extension in
+place and bind-mounts both halves over the installed wheel, so a Python edit
+needs only a restart:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+then mount `exllamav3/` and the resulting `.so` into the container, as
+`deploy/docker-compose.example.yml` does. Only worth it if you are iterating on
+the code. One caveat if you copy sources in rather than mounting them: `docker
+cp` does not preserve timestamps, so incremental builds silently skip changed
+translation units. That has produced two "the change did nothing" results here
+that were really "the change was never compiled".
 
 ### What you get, and how to prove it is live
 
 | feature | where it lives | proof it is active |
 |---|---|---|
-| p2b mixture-of-experts kernel | compiled `.so` | `EXL3_P2B_MOE=1` set, and `p2b_fused_moe` in the `.so` |
-| quantised QSA KV cache | Python + `.so` | `cache_mode: Q6` loads without the fp16-only assertion |
-| captured decode for the quant cache | `.so` | no eager fallback warning at load |
-| fused-count guard, allocator hoists | Python | in the bind-mounted package |
+| p2b mixture-of-experts kernel | compiled extension | `EXL3_P2B_MOE=1` set, and `p2b_fused_moe` importable |
+| quantised QSA KV cache | Python + extension | `cache_mode: Q6` loads without the fp16-only assertion |
+| captured decode for the quant cache | extension | no eager fallback warning at load |
+| fused-count guard, allocator hoists | Python | present in the installed package |
 
 The engine prints once on the first call of the quantised sparse path. If you
 never see that line at long context, the path is not engaging.
